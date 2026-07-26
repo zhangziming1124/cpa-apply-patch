@@ -12,18 +12,21 @@
 //     desktop needs before it renders its patch-review card.
 //
 // This plugin threads the needle without patching CPA:
-//   - ModelRegistrar registers a model whose ID hits an unused catalog
-//     template slug (default gpt-5.3-codex-spark), so the catalog branch that
-//     KEEPS apply_patch_tool_type=freeform serves it.
-//   - ModelRouter routes that slug to the built-in claude provider with the
-//     real target model (default claude-opus-5).
-//   - RequestInterceptor (before auth, before translation) rewrites the
-//     freeform custom tool into a {"input": string} function tool and replays
-//     custom_tool_call(_output) history as function_call(_output), which the
-//     native translator converts losslessly.
-//   - ResponseAfterTranslator rewrites the translated function_call events for
-//     those tools back into custom_tool_call events, mirroring the shapes in
+//   - RequestInterceptor (after auth, before executor translation — the only
+//     stage where the upstream format is known) rewrites, exclusively for
+//     ToFormat=claude, the freeform custom tools into {"input": string}
+//     function tools and replays custom_tool_call(_output) history as
+//     function_call(_output), which the native translator converts
+//     losslessly. codex/xai/openai upstreams support custom tools natively
+//     and are never touched.
+//   - ResponseAfterTranslator rewrites, exclusively for claude→openai-response
+//     translations, the function_call events of bridged tools back into
+//     custom_tool_call events, mirroring the shapes in
 //     internal/translator/openai/openai/responses/openai_openai-responses_response.go.
+//     Bridged tools are recognized by the {"input": string} schema fingerprint
+//     because CPA overwrites OriginalRequest with the interceptor's output.
+//   - Layer ① (the catalog) has no plugin hook and is solved client-side via
+//     model_catalog_json; see scripts/generate-model-catalog.ps1.
 package main
 
 /*
@@ -70,6 +73,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -81,7 +85,7 @@ import (
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.2.1"
+	pluginVersion = "0.3.0"
 )
 
 type pluginConfig struct {
@@ -190,16 +194,18 @@ func cliproxyPluginShutdown() {}
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
-		if errConfigure := configure(request); errConfigure != nil {
-			return nil, errConfigure
-		}
+		// A malformed config must not eject the plugin from the host: keep the
+		// previous (or default) config and register successfully anyway.
+		_ = configure(request)
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodPluginShutdown:
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodRequestInterceptBefore:
-		return interceptRequestBefore(request)
-	case pluginabi.MethodRequestInterceptAfter:
+		// Before auth the upstream format is unknown; all rewriting happens
+		// in the after-auth hook where ToFormat is populated.
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	case pluginabi.MethodRequestInterceptAfter:
+		return interceptRequestAfterAuth(request)
 	case pluginabi.MethodResponseNormalizeAfter:
 		return normalizeResponseAfter(request)
 	default:
@@ -220,21 +226,20 @@ func configure(raw []byte) error {
 			return errDecode
 		}
 	}
-	cfg.Models = normalizePatterns(cfg.Models, []string{"*"})
-	cfg.Tools = normalizePatterns(cfg.Tools, []string{"apply_patch"})
+	// An explicitly empty models/tools list matches nothing (fail-closed);
+	// defaults apply only when the key is absent, via defaultPluginConfig.
+	cfg.Models = normalizePatterns(cfg.Models)
+	cfg.Tools = normalizePatterns(cfg.Tools)
 	currentConfig.Store(cfg)
 	return nil
 }
 
-func normalizePatterns(values, fallback []string) []string {
+func normalizePatterns(values []string) []string {
 	out := make([]string, 0, len(values))
 	for _, v := range values {
 		if v = strings.ToLower(strings.TrimSpace(v)); v != "" {
 			out = append(out, v)
 		}
-	}
-	if len(out) == 0 {
-		return fallback
 	}
 	return out
 }
@@ -273,7 +278,7 @@ func pluginRegistration() registration {
 			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "总开关:关闭后停止全部改写,客户端将退回命令行改文件(插件仍保持加载)。"},
-				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "为哪些模型桥接 Codex 原生工具。支持前缀通配,如 claude*、grok*;单独的 * 表示全部模型。默认 [\"*\"]。非 GPT 模型要真正拿到 apply_patch,还需在客户端 model_catalog_json 里给该模型补 apply_patch_tool_type: freeform。"},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "为哪些模型桥接 Codex 原生工具。支持前缀通配,如 claude*;单独的 * 表示全部模型(安全:仅上游为 claude 的请求会被改写,GPT/grok 等原生路径不受影响)。默认 [\"*\"]。非 GPT 模型要真正拿到 apply_patch,还需在客户端 model_catalog_json 里给该模型补 apply_patch_tool_type: freeform。"},
 				{Name: "tools", Type: pluginapi.ConfigFieldTypeArray, Description: "桥接哪些 Codex freeform(custom)工具。默认 [\"apply_patch\"];填 * 表示客户端声明的所有 custom 工具都桥接。"},
 			},
 		},
@@ -286,19 +291,21 @@ func pluginRegistration() registration {
 
 // ---- request direction: custom tool → {"input": string} function ------------
 
-func interceptRequestBefore(raw []byte) ([]byte, error) {
+func interceptRequestAfterAuth(raw []byte) ([]byte, error) {
 	var req rpcRequestInterceptRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
 	cfg := loadedConfig()
-	// Only the OpenAI Responses protocol carries Codex custom tools; leave
-	// requests from claude/gemini/chat-completions clients untouched even
-	// when models/tools are configured with wildcards.
-	if sf := strings.ToLower(strings.TrimSpace(req.SourceFormat)); sf != "" && sf != "openai-response" {
+	// Only the OpenAI Responses protocol carries Codex custom tools, and only
+	// the claude upstream format lacks native support for them. Every other
+	// combination (codex/xai/openai upstreams, claude/gemini inbound clients)
+	// is left strictly untouched, wildcards notwithstanding.
+	if !strings.EqualFold(strings.TrimSpace(req.SourceFormat), "openai-response") ||
+		!strings.EqualFold(strings.TrimSpace(req.ToFormat), "claude") {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
-	if !cfg.Enabled || !modelEnabled(cfg, req.RequestedModel, req.Body) {
+	if !cfg.Enabled || !modelEnabled(cfg, req.RequestedModel, req.Model, req.Body) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	newBody, changed := rewriteRequestBody(cfg, req.Body)
@@ -309,10 +316,13 @@ func interceptRequestBefore(raw []byte) ([]byte, error) {
 }
 
 // modelEnabled reports whether this request's model is configured for Codex
-// native-tool bridging. Both the routing model name and the body's own model
-// field are considered, since only one of them is populated on some paths.
-func modelEnabled(cfg pluginConfig, requestedModel string, body []byte) bool {
-	return matchesAny(cfg.Models, requestedModel) || matchesAny(cfg.Models, gjson.GetBytes(body, "model").String())
+// native-tool bridging. The client-requested name, the resolved execution
+// model, and the body's own model field are all considered, since different
+// paths populate different subsets of them.
+func modelEnabled(cfg pluginConfig, requestedModel, execModel string, body []byte) bool {
+	return matchesAny(cfg.Models, requestedModel) ||
+		matchesAny(cfg.Models, execModel) ||
+		matchesAny(cfg.Models, gjson.GetBytes(body, "model").String())
 }
 
 func rewriteRequestBody(cfg pluginConfig, body []byte) ([]byte, bool) {
@@ -337,9 +347,14 @@ func rewriteRequestBody(cfg pluginConfig, body []byte) ([]byte, bool) {
 		}
 	}
 	if input := gjson.GetBytes(body, "input"); input.Exists() && input.IsArray() {
-		// Outputs carry no tool name, so remember which calls were bridged and
-		// rewrite only their matching outputs.
+		// Outputs carry no tool name, so collect the bridged call ids first
+		// (order-independent) and rewrite only their matching outputs.
 		bridged := map[string]struct{}{}
+		for _, item := range input.Array() {
+			if item.Get("type").String() == "custom_tool_call" && matchesAny(cfg.Tools, item.Get("name").String()) {
+				bridged[item.Get("call_id").String()] = struct{}{}
+			}
+		}
 		for i, item := range input.Array() {
 			switch item.Get("type").String() {
 			case "custom_tool_call":
@@ -347,7 +362,6 @@ func rewriteRequestBody(cfg pluginConfig, body []byte) ([]byte, bool) {
 					continue
 				}
 				callID := item.Get("call_id").String()
-				bridged[callID] = struct{}{}
 				wrapped, _ := json.Marshal(map[string]string{"input": item.Get("input").String()})
 				fc := map[string]any{
 					"type":      "function_call",
@@ -431,24 +445,48 @@ func customToolAsFunction(name, description string) map[string]any {
 // rewritten. Claude tool_use ids are globally unique, so a process-wide map is
 // safe across concurrent streams.
 type callTracker struct {
-	mu      sync.Mutex
+	mu      sync.Mutex // guards the map only; per-entry work uses entry.mu
 	entries map[string]*trackEntry
 }
 
+// trackEntry incrementally decodes the {"input": "..."} wrapper that the
+// interceptor's function schema imposes. Each arguments fragment is consumed
+// exactly once (O(fragment) per delta), the undecoded tail carried across
+// fragments is at most a few bytes, and total consumption is capped, so both
+// CPU and memory are bounded regardless of patch size.
 type trackEntry struct {
-	callID  string
-	seen    time.Time
-	rawArgs strings.Builder
-	decoded string
+	mu     sync.Mutex
+	callID string
+	seen   time.Time
+
+	phase    int    // decodeSearchKey → decodeSeekQuote → decodeInValue → decodeDone/decodeFailed
+	keyBuf   []byte // rolling tail while searching for the "input" key
+	pend     []byte // undecoded tail of the value (incomplete escape sequence)
+	consumed int64  // total fragment bytes fed, for the safety cap
 }
+
+const (
+	decodeSearchKey = iota
+	decodeSeekQuote
+	decodeInValue
+	decodeDone
+	decodeFailed
+)
+
+const (
+	inputKeyToken   = `"input"`
+	decodeByteCap   = 8 << 20 // stop emitting deltas past 8 MiB of arguments
+	trackerTTL      = 30 * time.Minute
+	trackerGCTarget = 64
+)
 
 var tracker = &callTracker{entries: map[string]*trackEntry{}}
 
 func (t *callTracker) put(itemID, callID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if len(t.entries) > 512 {
-		cutoff := time.Now().Add(-time.Hour)
+	if len(t.entries) >= trackerGCTarget {
+		cutoff := time.Now().Add(-trackerTTL)
 		for k, v := range t.entries {
 			if v.seen.Before(cutoff) {
 				delete(t.entries, k)
@@ -458,10 +496,15 @@ func (t *callTracker) put(itemID, callID string) {
 	t.entries[itemID] = &trackEntry{callID: callID, seen: time.Now()}
 }
 
-func (t *callTracker) get(itemID string) (string, bool) {
+func (t *callTracker) lookup(itemID string) (*trackEntry, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	entry, ok := t.entries[itemID]
+	return entry, ok
+}
+
+func (t *callTracker) get(itemID string) (string, bool) {
+	entry, ok := t.lookup(itemID)
 	if !ok {
 		return "", false
 	}
@@ -472,97 +515,147 @@ func (t *callTracker) get(itemID string) (string, bool) {
 // portion of the unwrapped input string, so streamed deltas concatenate to
 // exactly the value later carried by custom_tool_call_input.done.
 func (t *callTracker) appendDelta(itemID, fragment string) (callID, newPart string, ok bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	entry, found := t.entries[itemID]
+	entry, found := t.lookup(itemID)
 	if !found {
 		return "", "", false
 	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 	entry.seen = time.Now()
-	entry.rawArgs.WriteString(fragment)
-	decoded := decodeWrappedInputPrefix(entry.rawArgs.String())
-	if len(decoded) > len(entry.decoded) && strings.HasPrefix(decoded, entry.decoded) {
-		newPart = decoded[len(entry.decoded):]
-		entry.decoded = decoded
+	entry.consumed += int64(len(fragment))
+	if entry.consumed > decodeByteCap {
+		entry.phase = decodeFailed
 	}
-	return entry.callID, newPart, true
+	if entry.phase == decodeDone || entry.phase == decodeFailed {
+		return entry.callID, "", true
+	}
+	return entry.callID, entry.consume(fragment), true
+}
+
+// consume advances the incremental decoder over one fragment and returns the
+// decoded value bytes it yields. Malformed content flips the entry to
+// decodeFailed: deltas go quiet and the done event stays authoritative.
+func (e *trackEntry) consume(fragment string) string {
+	var out strings.Builder
+	data := fragment
+
+	if e.phase == decodeSearchKey {
+		e.keyBuf = append(e.keyBuf, data...)
+		idx := strings.Index(string(e.keyBuf), inputKeyToken)
+		if idx < 0 {
+			if keep := len(inputKeyToken) - 1; len(e.keyBuf) > keep {
+				e.keyBuf = e.keyBuf[len(e.keyBuf)-keep:]
+			}
+			return ""
+		}
+		data = string(e.keyBuf[idx+len(inputKeyToken):])
+		e.keyBuf = nil
+		e.phase = decodeSeekQuote
+	}
+
+	if e.phase == decodeSeekQuote {
+		i := 0
+		for i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\n' || data[i] == '\r' || data[i] == ':') {
+			i++
+		}
+		if i >= len(data) {
+			return ""
+		}
+		if data[i] != '"' {
+			e.phase = decodeFailed
+			return ""
+		}
+		data = data[i+1:]
+		e.phase = decodeInValue
+	}
+
+	s := string(e.pend) + data
+	e.pend = nil
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '"' {
+			e.phase = decodeDone
+			break
+		}
+		if c != '\\' {
+			// Copy a run of plain bytes in one go.
+			j := i
+			for j < len(s) && s[j] != '"' && s[j] != '\\' {
+				j++
+			}
+			out.WriteString(s[i:j])
+			i = j
+			continue
+		}
+		if i+1 >= len(s) {
+			e.pend = []byte(s[i:])
+			break
+		}
+		switch s[i+1] {
+		case '"', '\\', '/':
+			out.WriteByte(s[i+1])
+			i += 2
+		case 'b':
+			out.WriteByte('\b')
+			i += 2
+		case 'f':
+			out.WriteByte('\f')
+			i += 2
+		case 'n':
+			out.WriteByte('\n')
+			i += 2
+		case 'r':
+			out.WriteByte('\r')
+			i += 2
+		case 't':
+			out.WriteByte('\t')
+			i += 2
+		case 'u':
+			if i+6 > len(s) {
+				e.pend = []byte(s[i:])
+				i = len(s)
+				break
+			}
+			code, errParse := strconv.ParseUint(s[i+2:i+6], 16, 32)
+			if errParse != nil {
+				e.phase = decodeFailed
+				return out.String()
+			}
+			if code >= 0xD800 && code <= 0xDBFF {
+				// High surrogate: need the paired \uXXXX low surrogate.
+				if i+12 > len(s) {
+					e.pend = []byte(s[i:])
+					i = len(s)
+					break
+				}
+				if s[i+6] != '\\' || s[i+7] != 'u' {
+					e.phase = decodeFailed
+					return out.String()
+				}
+				low, errLow := strconv.ParseUint(s[i+8:i+12], 16, 32)
+				if errLow != nil {
+					e.phase = decodeFailed
+					return out.String()
+				}
+				out.WriteRune(utf16.DecodeRune(rune(code), rune(low)))
+				i += 12
+			} else {
+				out.WriteRune(rune(code))
+				i += 6
+			}
+		default:
+			e.phase = decodeFailed
+			return out.String()
+		}
+	}
+	return out.String()
 }
 
 func (t *callTracker) drop(itemID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.entries, itemID)
-}
-
-// decodeWrappedInputPrefix incrementally decodes the {"input": "..."} wrapper
-// that the interceptor's function schema imposes: given a prefix of the raw
-// arguments JSON, it returns the decoded value of the input string so far,
-// stopping before any incomplete escape sequence.
-func decodeWrappedInputPrefix(raw string) string {
-	keyIdx := strings.Index(raw, `"input"`)
-	if keyIdx < 0 {
-		return ""
-	}
-	i := keyIdx + len(`"input"`)
-	for i < len(raw) && (raw[i] == ' ' || raw[i] == '\t' || raw[i] == '\n' || raw[i] == '\r' || raw[i] == ':') {
-		i++
-	}
-	if i >= len(raw) || raw[i] != '"' {
-		return ""
-	}
-	value := raw[i+1:]
-	prefix := longestCompleteJSONStringPrefix(value)
-	if prefix == "" {
-		return ""
-	}
-	var out string
-	if errUnmarshal := json.Unmarshal([]byte(`"`+prefix+`"`), &out); errUnmarshal != nil {
-		return ""
-	}
-	return out
-}
-
-// longestCompleteJSONStringPrefix returns the longest prefix of a JSON string
-// body (content between the quotes) that ends on a complete escape sequence
-// and stops at the closing quote.
-func longestCompleteJSONStringPrefix(s string) string {
-	i := 0
-	lastComplete := 0
-	for i < len(s) {
-		c := s[i]
-		if c == '"' {
-			break
-		}
-		if c == '\\' {
-			if i+1 >= len(s) {
-				break
-			}
-			if s[i+1] == 'u' {
-				if i+6 > len(s) {
-					break
-				}
-				code, errParse := strconv.ParseUint(s[i+2:i+6], 16, 32)
-				if errParse != nil {
-					break
-				}
-				if code >= 0xD800 && code <= 0xDBFF {
-					// High surrogate: require the full low-surrogate escape too.
-					if i+12 > len(s) || s[i+6] != '\\' || s[i+7] != 'u' {
-						break
-					}
-					i += 12
-				} else {
-					i += 6
-				}
-			} else {
-				i += 2
-			}
-		} else {
-			i++
-		}
-		lastComplete = i
-	}
-	return s[:lastComplete]
 }
 
 func normalizeResponseAfter(raw []byte) ([]byte, error) {
@@ -577,10 +670,10 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 	if !cfg.Enabled || len(req.Body) == 0 {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	// Only rewrite translations whose client side is the OpenAI Responses
-	// protocol; other format pairs (claude→claude passthrough, gemini, chat
-	// completions) never carry Codex custom_tool_call events.
-	if !strings.EqualFold(req.FromFormat, "openai-response") && !strings.EqualFold(req.ToFormat, "openai-response") {
+	// Strictly the claude→openai-response translation pair: the only path the
+	// request side bridges. codex/xai native paths emit custom_tool_call
+	// themselves and must not be touched twice.
+	if !strings.EqualFold(req.FromFormat, "claude") || !strings.EqualFold(req.ToFormat, "openai-response") {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
 	origModel := gjson.GetBytes(req.OriginalRequest, "model").String()
@@ -601,29 +694,62 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.PayloadResponse{Body: newBody})
 }
 
-// customToolNames collects the configured tool names the client declared as
-// freeform custom tools. Explicitly configured names are always included: on
-// some paths OriginalRequest is captured after the request interceptor already
-// rewrote the declaration into a function tool, which would otherwise hide it.
+// customToolNames collects (lowercased) the tool names that were bridged for
+// this request. CPA overwrites OriginalRequest with the interceptor's output,
+// so a bridged tool appears either as its original type=custom declaration
+// (paths without interception) or as the interceptor's function form, which is
+// recognized by its exact {"input": string} schema fingerprint. A client's own
+// same-name function tool with a different schema matches neither and its
+// responses are left alone.
 func customToolNames(cfg pluginConfig, originalRequest []byte) map[string]struct{} {
 	names := map[string]struct{}{}
-	for _, t := range cfg.Tools {
-		if t != "*" && !strings.HasSuffix(t, "*") {
-			names[t] = struct{}{}
-		}
-	}
 	if tools := gjson.GetBytes(originalRequest, "tools"); tools.Exists() && tools.IsArray() {
 		for _, tool := range tools.Array() {
-			if tool.Get("type").String() != "custom" {
+			name := strings.TrimSpace(tool.Get("name").String())
+			if name == "" || !matchesAny(cfg.Tools, name) {
 				continue
 			}
-			name := strings.TrimSpace(tool.Get("name").String())
-			if name != "" && matchesAny(cfg.Tools, name) {
-				names[name] = struct{}{}
+			switch tool.Get("type").String() {
+			case "custom":
+				names[strings.ToLower(name)] = struct{}{}
+			case "function":
+				if isBridgedFunctionSchema(tool) {
+					names[strings.ToLower(name)] = struct{}{}
+				}
 			}
 		}
 	}
 	return names
+}
+
+// isBridgedFunctionSchema reports whether a function tool declaration carries
+// the exact parameter schema produced by customToolAsFunction.
+func isBridgedFunctionSchema(tool gjson.Result) bool {
+	params := tool.Get("parameters")
+	if params.Get("type").String() != "object" {
+		return false
+	}
+	if params.Get("additionalProperties").Exists() && params.Get("additionalProperties").Bool() {
+		return false
+	}
+	req := params.Get("required")
+	if !req.IsArray() || len(req.Array()) != 1 || req.Array()[0].String() != "input" {
+		return false
+	}
+	props := params.Get("properties")
+	if !props.IsObject() {
+		return false
+	}
+	count := 0
+	ok := true
+	props.ForEach(func(key, value gjson.Result) bool {
+		count++
+		if key.String() != "input" || value.Get("type").String() != "string" {
+			ok = false
+		}
+		return true
+	})
+	return ok && count == 1
 }
 
 func isSSEChunk(body []byte) bool {
@@ -652,7 +778,7 @@ func rewriteSSEChunk(chunk []byte, names map[string]struct{}) ([]byte, bool) {
 			return nil, false
 		}
 		name := item.Get("name").String()
-		if _, ok := names[name]; !ok {
+		if _, ok := names[strings.ToLower(name)]; !ok {
 			return nil, false
 		}
 		callID := item.Get("call_id").String()
@@ -710,7 +836,7 @@ func rewriteSSEChunk(chunk []byte, names map[string]struct{}) ([]byte, bool) {
 			return nil, false
 		}
 		name := item.Get("name").String()
-		if _, ok := names[name]; !ok {
+		if _, ok := names[strings.ToLower(name)]; !ok {
 			return nil, false
 		}
 		callID := item.Get("call_id").String()
@@ -773,7 +899,7 @@ func rewriteOutputArray(doc, path string, names map[string]struct{}) (string, bo
 			continue
 		}
 		name := item.Get("name").String()
-		if _, ok := names[name]; !ok {
+		if _, ok := names[strings.ToLower(name)]; !ok {
 			continue
 		}
 		callID := item.Get("call_id").String()

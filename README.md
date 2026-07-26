@@ -20,7 +20,7 @@ Codex 客户端通过 CPA 调 Claude 等第三方模型时,**apply_patch 工具�
 - **③ 响应方向** — `ResponseAfterTranslator` 把翻译产物里这些工具的 `function_call` 事件族改写回 `custom_tool_call` 事件族(`output_item.added` / `custom_tool_call_input.delta` / `.done` / `output_item.done` / `response.completed`),流式 delta 经增量 JSON 字符串解码,**保证 delta 累加与 done 值逐字节一致**,符合官方 Responses API 语义。
 - **① 目录层在客户端解决** — CPA 的目录响应链没有插件挂点,但 Codex 客户端支持 `model_catalog_json` 本地目录覆盖:用 [`scripts/generate-model-catalog.ps1`](scripts/generate-model-catalog.ps1) 从你的 CPA 拉取全量目录、给文本模型补上 `apply_patch_tool_type: "freeform"`,模型保持**真实身份与真实上下文窗口**(不借用 GPT 档案)。
 
-GPT 系模型走 CPA 原生路径,插件默认对它们零干预(OpenAI 兼容上游本身支持 custom 工具往返,只缺目录字段,由客户端目录一并补齐)。
+GPT 系模型走 CPA 原生路径,插件对它们**结构性零干预**:请求改写挂在 AfterAuth 钩子上并只对 `ToFormat=claude` 的请求生效,响应改写只对 claude→openai-response 翻译对生效——codex/xai 等原生支持 custom 工具的上游无论配置怎么写都不会被触碰(OpenAI 兼容上游只缺目录字段,由客户端目录一并补齐)。
 
 ## 安装
 

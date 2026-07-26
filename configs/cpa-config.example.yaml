@@ -1,0 +1,16 @@
+# CPA config.yaml 中与本插件相关的片段。
+# 插件文件放置于: <CPA 目录>/plugins/<goos>/<goarch>/cpa-apply-patch-v<版本>.so
+plugins:
+  enabled: true
+  configs:
+    cpa-apply-patch:
+      # 总开关:关闭后停止全部改写,客户端将退回命令行改文件。
+      enabled: true
+      # 为哪些模型桥接 Codex 原生工具。支持前缀通配(claude*、grok*),* 表示全部。
+      # 非 GPT 模型要真正拿到 apply_patch,还需在客户端 model_catalog_json
+      # 里给该模型补 apply_patch_tool_type: freeform(见 scripts/generate-model-catalog.ps1)。
+      models:
+        - "*"
+      # 桥接哪些 Codex freeform(custom)工具;* 表示客户端声明的所有 custom 工具。
+      tools:
+        - apply_patch

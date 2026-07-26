@@ -1,4 +1,4 @@
-module cpa-apply-patch
+module github.com/zhangziming1124/cpa-apply-patch
 
 go 1.26.0
 

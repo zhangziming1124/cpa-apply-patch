@@ -68,7 +68,7 @@ import (
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.4.0"
+	pluginVersion = "0.4.1"
 )
 
 type pluginConfig struct {
@@ -810,21 +810,44 @@ func isBridgedFunctionSchema(tool gjson.Result) bool {
 
 func isSSEChunk(body []byte) bool {
 	trimmed := strings.TrimLeft(string(body), " \t\r\n")
-	return strings.HasPrefix(trimmed, "event:")
+	// xAI (and some other executors) emit "event:" and "data:" as separate
+	// stream chunks. Treat both as SSE so the response rewriter can act.
+	return strings.HasPrefix(trimmed, "event:") || strings.HasPrefix(trimmed, "data:")
 }
 
 func rewriteSSEChunk(chunk []byte, names map[string]struct{}) ([]byte, bool) {
 	s := string(chunk)
-	dataIdx := strings.Index(s, "\ndata: ")
-	if dataIdx < 0 || !strings.HasPrefix(s, "event: ") {
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	// Bare event lines carry no payload; the following data line has the JSON.
+	if strings.HasPrefix(trimmed, "event:") && !strings.Contains(s, "\ndata:") {
 		return nil, false
 	}
-	event := strings.TrimSpace(s[len("event: "):dataIdx])
-	data := s[dataIdx+len("\ndata: "):]
+
+	event := ""
+	data := ""
 	suffix := ""
+	if strings.HasPrefix(trimmed, "event:") {
+		dataIdx := strings.Index(s, "\ndata: ")
+		if dataIdx < 0 {
+			return nil, false
+		}
+		event = strings.TrimSpace(s[len("event: "):dataIdx])
+		data = s[dataIdx+len("\ndata: "):]
+	} else if strings.HasPrefix(trimmed, "data:") {
+		// Standalone data line (xAI stream path).
+		rest := strings.TrimSpace(trimmed[len("data:"):])
+		data = rest
+		event = gjson.Get(data, "type").String()
+	} else {
+		return nil, false
+	}
+
 	for strings.HasSuffix(data, "\n") {
 		data = data[:len(data)-1]
 		suffix += "\n"
+	}
+	if event == "" {
+		event = gjson.Get(data, "type").String()
 	}
 
 	switch event {
@@ -852,7 +875,7 @@ func rewriteSSEChunk(chunk []byte, names map[string]struct{}) ([]byte, bool) {
 		if errSet != nil {
 			return nil, false
 		}
-		return assembleSSE(event, newData, suffix), true
+		return assembleSSEData(event, newData, suffix, chunk), true
 
 	case "response.function_call_arguments.delta":
 		itemID := gjson.Get(data, "item_id").String()
@@ -868,7 +891,7 @@ func rewriteSSEChunk(chunk []byte, names map[string]struct{}) ([]byte, bool) {
 			"delta":           newPart,
 		}
 		rawPayload, _ := json.Marshal(payload)
-		return assembleSSE("response.custom_tool_call_input.delta", string(rawPayload), suffix), true
+		return assembleSSEData("response.custom_tool_call_input.delta", string(rawPayload), suffix, chunk), true
 
 	case "response.function_call_arguments.done":
 		itemID := gjson.Get(data, "item_id").String()
@@ -884,7 +907,7 @@ func rewriteSSEChunk(chunk []byte, names map[string]struct{}) ([]byte, bool) {
 			"input":           unwrapCustomToolInput(gjson.Get(data, "arguments").String()),
 		}
 		rawPayload, _ := json.Marshal(payload)
-		return assembleSSE("response.custom_tool_call_input.done", string(rawPayload), suffix), true
+		return assembleSSEData("response.custom_tool_call_input.done", string(rawPayload), suffix, chunk), true
 
 	case "response.output_item.done":
 		item := gjson.Get(data, "item")
@@ -910,16 +933,26 @@ func rewriteSSEChunk(chunk []byte, names map[string]struct{}) ([]byte, bool) {
 		if errSet != nil {
 			return nil, false
 		}
-		return assembleSSE(event, newData, suffix), true
+		return assembleSSEData(event, newData, suffix, chunk), true
 
 	case "response.completed":
 		newData, changed := rewriteOutputArray(data, "response.output", names)
 		if !changed {
 			return nil, false
 		}
-		return assembleSSE(event, newData, suffix), true
+		return assembleSSEData(event, newData, suffix, chunk), true
 	}
 	return nil, false
+}
+
+// assembleSSEData rebuilds an SSE chunk. Standalone data lines (xAI) stay as
+// data-only frames; combined event+data inputs keep both lines.
+func assembleSSEData(event, data, suffix string, original []byte) []byte {
+	trimmed := strings.TrimLeft(string(original), " \t\r\n")
+	if strings.HasPrefix(trimmed, "data:") {
+		return []byte("data: " + data + suffix)
+	}
+	return []byte("event: " + event + "\ndata: " + data + suffix)
 }
 
 func assembleSSE(event, data, suffix string) []byte {

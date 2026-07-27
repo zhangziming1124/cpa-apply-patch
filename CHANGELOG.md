@@ -1,3 +1,10 @@
+### v0.4.0
+
+- Config panel: add backend service toggles `backend_claude` / `backend_xai` (checkbox-style booleans) instead of hard-coding Claude only.
+- Bridge Grok/xAI: when `backend_xai` is on, rewrite freeform apply_patch for grok* models on ToFormat=codex before CPA's xAI executor deletes custom apply_patch.
+- Keep GPT/OpenAI codex native paths untouched (ToFormat=codex + non-grok models are not bridged).
+- Absent boolean keys keep defaults (true/true) via overlay unmarshalling.
+
 # Changelog
 
 ## v0.3.0 — 2026-07-26
@@ -28,3 +35,4 @@
 - v0.1.2 apply_patch 工具描述加入补丁格式硬规则(整行逐字节复制、含缩进、上下文锚定),缓解模型半行补丁问题。
 - v0.1.1 流式 delta 改为增量 JSON 字符串解码,保证 `custom_tool_call_input.delta` 累加与 `.done` 逐字节一致。
 - v0.1.0 首版:借壳 GPT 模板 slug 注册模型 + ModelRouter 路由到 Claude + 请求/响应双向改写,三层链路首次打通。
+

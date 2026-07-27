@@ -1,0 +1,7 @@
+### v0.4.0
+
+- Config panel: add backend service toggles `backend_claude` / `backend_xai` (checkbox-style booleans) instead of hard-coding Claude only.
+- Bridge Grok/xAI: when `backend_xai` is on, rewrite freeform apply_patch for grok* models on ToFormat=codex before CPA's xAI executor deletes custom apply_patch.
+- Keep GPT/OpenAI codex native paths untouched (ToFormat=codex + non-grok models are not bridged).
+- Absent boolean keys keep defaults (true/true) via overlay unmarshalling.
+

@@ -1,32 +1,15 @@
-// cpa-apply-patch bridges the Codex client's apply_patch tool onto Claude
-// backends behind CLIProxyAPI.
+// cpa-apply-patch bridges the Codex client's freeform apply_patch tool onto
+// upstreams behind CLIProxyAPI that would otherwise drop or mishandle it.
 //
-// CPA denies apply_patch to non-GPT models at three layers:
-//  1. /v1/models?client_version strips apply_patch_tool_type from every model
-//     that misses a template slug (internal/client/codex/models/models.go:254).
-//  2. The openai-responses→claude request translator drops the freeform
-//     apply_patch custom tool outright and silently loses
-//     custom_tool_call(_output) history items.
-//  3. The claude→openai-responses response translator only ever emits
-//     function_call events, never the custom_tool_call events the Codex
-//     desktop needs before it renders its patch-review card.
+// Backend toggles (management panel checkboxes):
+//   - backend_claude: bridge when ToFormat=claude
+//   - backend_xai:    bridge when ToFormat=codex and model is Grok/xAI
+//                     (xAI executor hard-deletes type=custom name=apply_patch)
+// True OpenAI/codex GPT paths stay untouched.
 //
-// This plugin threads the needle without patching CPA:
-//   - RequestInterceptor (after auth, before executor translation — the only
-//     stage where the upstream format is known) rewrites, exclusively for
-//     ToFormat=claude, the freeform custom tools into {"input": string}
-//     function tools and replays custom_tool_call(_output) history as
-//     function_call(_output), which the native translator converts
-//     losslessly. codex/xai/openai upstreams support custom tools natively
-//     and are never touched.
-//   - ResponseAfterTranslator rewrites, exclusively for claude→openai-response
-//     translations, the function_call events of bridged tools back into
-//     custom_tool_call events, mirroring the shapes in
-//     internal/translator/openai/openai/responses/openai_openai-responses_response.go.
-//     Bridged tools are recognized by the {"input": string} schema fingerprint
-//     because CPA overwrites OriginalRequest with the interceptor's output.
-//   - Layer ① (the catalog) has no plugin hook and is solved client-side via
-//     model_catalog_json; see scripts/generate-model-catalog.ps1.
+// Request side converts custom tools to {"input": string} function tools before
+// the upstream translator/executor runs. Response side restores custom_tool_call
+// events. Non-GPT clients still need model_catalog_json freeform declarations.
 package main
 
 /*
@@ -85,21 +68,34 @@ import (
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.3.0"
+	pluginVersion = "0.4.0"
 )
 
 type pluginConfig struct {
-	Enabled bool     `yaml:"enabled"`
-	Models  []string `yaml:"models"`
-	Tools   []string `yaml:"tools"`
+	Enabled       bool     `yaml:"enabled"`
+	BackendClaude bool     `yaml:"backend_claude"`
+	BackendXAI    bool     `yaml:"backend_xai"`
+	Models        []string `yaml:"models"`
+	Tools         []string `yaml:"tools"`
 }
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled: true,
-		Models:  []string{"*"},
-		Tools:   []string{"apply_patch"},
+		Enabled:       true,
+		BackendClaude: true,
+		BackendXAI:    true,
+		Models:        []string{"*"},
+		Tools:         []string{"apply_patch"},
 	}
+}
+
+// configOverlay lets absent boolean keys keep defaults instead of yaml false.
+type configOverlay struct {
+	Enabled       *bool    `yaml:"enabled"`
+	BackendClaude *bool    `yaml:"backend_claude"`
+	BackendXAI    *bool    `yaml:"backend_xai"`
+	Models        []string `yaml:"models"`
+	Tools         []string `yaml:"tools"`
 }
 
 var currentConfig atomic.Value
@@ -222,12 +218,28 @@ func configure(raw []byte) error {
 	}
 	cfg := defaultPluginConfig()
 	if len(req.ConfigYAML) > 0 {
-		if errDecode := yaml.Unmarshal(req.ConfigYAML, &cfg); errDecode != nil {
+		var overlay configOverlay
+		if errDecode := yaml.Unmarshal(req.ConfigYAML, &overlay); errDecode != nil {
 			return errDecode
 		}
+		if overlay.Enabled != nil {
+			cfg.Enabled = *overlay.Enabled
+		}
+		if overlay.BackendClaude != nil {
+			cfg.BackendClaude = *overlay.BackendClaude
+		}
+		if overlay.BackendXAI != nil {
+			cfg.BackendXAI = *overlay.BackendXAI
+		}
+		// Explicit empty models/tools lists match nothing (fail-closed).
+		// Absent keys keep defaults from defaultPluginConfig.
+		if overlay.Models != nil {
+			cfg.Models = overlay.Models
+		}
+		if overlay.Tools != nil {
+			cfg.Tools = overlay.Tools
+		}
 	}
-	// An explicitly empty models/tools list matches nothing (fail-closed);
-	// defaults apply only when the key is absent, via defaultPluginConfig.
 	cfg.Models = normalizePatterns(cfg.Models)
 	cfg.Tools = normalizePatterns(cfg.Tools)
 	currentConfig.Store(cfg)
@@ -277,9 +289,11 @@ func pluginRegistration() registration {
 			Author:           "zhangziming",
 			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "总开关:关闭后停止全部改写,客户端将退回命令行改文件(插件仍保持加载)。"},
-				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "为哪些模型桥接 Codex 原生工具。支持前缀通配,如 claude*;单独的 * 表示全部模型(安全:仅上游为 claude 的请求会被改写,GPT/grok 等原生路径不受影响)。默认 [\"*\"]。非 GPT 模型要真正拿到 apply_patch,还需在客户端 model_catalog_json 里给该模型补 apply_patch_tool_type: freeform。"},
-				{Name: "tools", Type: pluginapi.ConfigFieldTypeArray, Description: "桥接哪些 Codex freeform(custom)工具。默认 [\"apply_patch\"];填 * 表示客户端声明的所有 custom 工具都桥接。"},
+				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "总开关。关闭后停止全部改写，客户端将退回命令行改文件（插件仍保持加载）。"},
+				{Name: "backend_claude", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：Claude。开启后，上游格式为 claude 时桥接 apply_patch（CPA 会丢弃 freeform custom 工具）。默认开启。"},
+				{Name: "backend_xai", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：xAI / Grok。开启后，对 grok* 模型在进入 xAI 执行器前桥接 apply_patch（CPA 会硬删除 type=custom name=apply_patch）。默认开启。不影响 GPT/OpenAI codex 原生路径。"},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "模型名过滤（可与后端勾选叠加）。支持前缀通配，如 grok*、claude*；* 表示不额外限制模型名。默认 [\"*\"]。非 GPT 模型还须在客户端 model_catalog_json 补 apply_patch_tool_type: freeform。"},
+				{Name: "tools", Type: pluginapi.ConfigFieldTypeArray, Description: "桥接哪些 Codex freeform(custom) 工具。默认 [\"apply_patch\"]；填 * 表示客户端声明的所有 custom 工具都桥接。"},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -297,15 +311,17 @@ func interceptRequestAfterAuth(raw []byte) ([]byte, error) {
 		return nil, errUnmarshal
 	}
 	cfg := loadedConfig()
-	// Only the OpenAI Responses protocol carries Codex custom tools, and only
-	// the claude upstream format lacks native support for them. Every other
-	// combination (codex/xai/openai upstreams, claude/gemini inbound clients)
-	// is left strictly untouched, wildcards notwithstanding.
-	if !strings.EqualFold(strings.TrimSpace(req.SourceFormat), "openai-response") ||
-		!strings.EqualFold(strings.TrimSpace(req.ToFormat), "claude") {
+	if !cfg.Enabled {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
-	if !cfg.Enabled || !modelEnabled(cfg, req.RequestedModel, req.Model, req.Body) {
+	// Codex freeform tools only arrive on the OpenAI Responses protocol.
+	if !strings.EqualFold(strings.TrimSpace(req.SourceFormat), "openai-response") {
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	if !requestBackendEnabled(cfg, req.ToFormat, req.RequestedModel, req.Model, req.Body) {
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
+	if !modelEnabled(cfg, req.RequestedModel, req.Model, req.Body) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	newBody, changed := rewriteRequestBody(cfg, req.Body)
@@ -324,6 +340,46 @@ func modelEnabled(cfg pluginConfig, requestedModel, execModel string, body []byt
 		matchesAny(cfg.Models, execModel) ||
 		matchesAny(cfg.Models, gjson.GetBytes(body, "model").String())
 }
+
+// requestBackendEnabled reports whether the selected upstream format/backend
+// is checked on for this request.
+func requestBackendEnabled(cfg pluginConfig, toFormat, requestedModel, execModel string, body []byte) bool {
+	toFormat = strings.ToLower(strings.TrimSpace(toFormat))
+	switch toFormat {
+	case "claude":
+		return cfg.BackendClaude
+	case "codex":
+		// xAI reuses the codex wire format. Only bridge Grok/xAI models so
+		// true OpenAI/codex GPT paths keep native freeform apply_patch.
+		return cfg.BackendXAI && (isXAIModel(requestedModel) || isXAIModel(execModel) || isXAIModel(gjson.GetBytes(body, "model").String()))
+	default:
+		return false
+	}
+}
+
+// responseBackendEnabled reports whether response rewriting should run for the
+// translator pair that produced this chunk.
+func responseBackendEnabled(cfg pluginConfig, fromFormat, modelA, modelB string) bool {
+	fromFormat = strings.ToLower(strings.TrimSpace(fromFormat))
+	switch fromFormat {
+	case "claude":
+		return cfg.BackendClaude
+	case "codex", "openai-response":
+		return cfg.BackendXAI && (isXAIModel(modelA) || isXAIModel(modelB))
+	default:
+		return false
+	}
+}
+
+// isXAIModel identifies Grok/xAI model ids without relying on auth metadata.
+func isXAIModel(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return false
+	}
+	return strings.HasPrefix(model, "grok") || strings.Contains(model, "grok-")
+}
+
 
 func rewriteRequestBody(cfg pluginConfig, body []byte) ([]byte, bool) {
 	changed := false
@@ -670,13 +726,13 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 	if !cfg.Enabled || len(req.Body) == 0 {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	// Strictly the claude→openai-response translation pair: the only path the
-	// request side bridges. codex/xai native paths emit custom_tool_call
-	// themselves and must not be touched twice.
-	if !strings.EqualFold(req.FromFormat, "claude") || !strings.EqualFold(req.ToFormat, "openai-response") {
+	if !strings.EqualFold(req.ToFormat, "openai-response") {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
 	origModel := gjson.GetBytes(req.OriginalRequest, "model").String()
+	if !responseBackendEnabled(cfg, req.FromFormat, origModel, req.Model) {
+		return okEnvelope(pluginapi.PayloadResponse{})
+	}
 	if !matchesAny(cfg.Models, origModel) && !matchesAny(cfg.Models, req.Model) {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}

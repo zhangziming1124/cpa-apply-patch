@@ -1,11 +1,26 @@
-### v0.4.0
+# Changelog
+
+## v0.4.3 — 2026-07-30
+
+- **流式出字卡顿修复**：`response.normalize_after` 热路径不再在每个 SSE 文本/推理 delta 上 base64 反序列化整份 `OriginalRequest`（常 1MB+）。先解析小字段 + `Body`，非 `function_call*` 相关事件立即透传；仅在可能改写 apply_patch 的帧上才加载 tools 名单。
+- `function_call_arguments.delta/done` 只依赖进程内 tracker，不再扫 tools。
+- 宿主侧仍会每片携带 OriginalRequest（CPA 限制），但插件侧避免了大字段解码，Desktop 一字一字出的观感应明显改善。
+
+## v0.4.2 — 2026-07-27
+
+- **Grok 原生 apply_patch 信封归一化**：模型常把首行写成 `*** Begin Patch ***`（尾部多 ` ***`），Codex 客户端校验直接失败并退回 shell 写盘。响应侧 `unwrapCustomToolInput` / 流式 delta 与请求历史改写统一归一为 `*** Begin Patch` / `*** End Patch`，继续走 `custom_tool_call` 原生路径与桌面审阅卡。
+- 工具描述写明「首行/末行不得带尾部星号」，降低模型再生成错误信封的概率。
+
+## v0.4.1
+
+- xAI SSE：支持 standalone `data:` 行改写，Grok 响应侧恢复 `custom_tool_call`（见 v0.4.1 修复说明）。
+
+## v0.4.0
 
 - Config panel: add backend service toggles `backend_claude` / `backend_xai` (checkbox-style booleans) instead of hard-coding Claude only.
 - Bridge Grok/xAI: when `backend_xai` is on, rewrite freeform apply_patch for grok* models on ToFormat=codex before CPA's xAI executor deletes custom apply_patch.
 - Keep GPT/OpenAI codex native paths untouched (ToFormat=codex + non-grok models are not bridged).
 - Absent boolean keys keep defaults (true/true) via overlay unmarshalling.
-
-# Changelog
 
 ## v0.3.0 — 2026-07-26
 

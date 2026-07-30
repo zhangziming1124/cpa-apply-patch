@@ -77,6 +77,7 @@ Linux/macOS 直接 `make build VERSION=0.2.1`。
 ## 已知限制
 
 - **补丁行级精度依赖模型**:工具描述里内置了格式硬规则(上下文行整行逐字节复制、含缩进),但这属于提示级约束。注意 apply_patch 执行器对缩进不符的补丁会**模糊匹配并按补丁字面缩进静默落盘**(不报错),Python/YAML 等缩进敏感文件需留意。
+- **信封行尾部星号(v0.4.2 已兜底)**:Grok 等模型常输出 `*** Begin Patch ***` / `*** End Patch ***`,Codex 要求首行恰好是 `*** Begin Patch`。插件在响应改写时归一化信封行,避免 verification failed 后退回 shell 写盘。
 - **不支持 code mode**:`tool_mode: code_mode_only`(GPT-5.6 系的 JS 工具调用形态)在非 GPT 模型上会被客户端 harness 拒绝,请勿在本地目录里给非 GPT 模型设置该字段。
 - CPA 升级若变更插件 ABI(当前 v1),需按新 SDK 重新编译。
 

@@ -63,12 +63,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"github.com/zhangziming1124/cpa-apply-patch/patchenv"
 	"gopkg.in/yaml.v3"
 )
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.4.1"
+	pluginVersion = "0.4.3"
 )
 
 type pluginConfig struct {
@@ -418,7 +419,11 @@ func rewriteRequestBody(cfg pluginConfig, body []byte) ([]byte, bool) {
 					continue
 				}
 				callID := item.Get("call_id").String()
-				wrapped, _ := json.Marshal(map[string]string{"input": item.Get("input").String()})
+				rawInput := item.Get("input").String()
+				if strings.EqualFold(item.Get("name").String(), "apply_patch") {
+					rawInput = patchenv.Normalize(rawInput)
+				}
+				wrapped, _ := json.Marshal(map[string]string{"input": rawInput})
 				fc := map[string]any{
 					"type":      "function_call",
 					"id":        "fc_" + callID,
@@ -465,7 +470,12 @@ func customToolAsFunction(name, description string) map[string]any {
 		if desc == "" {
 			desc = "Create, update, or delete files."
 		}
-		desc += "\nProvide the complete patch envelope (\"*** Begin Patch\" through \"*** End Patch\") as the `input` string argument, exactly as you would emit it for the freeform apply_patch tool." +
+		desc += "\nProvide the complete patch envelope as the `input` string argument for the freeform apply_patch tool." +
+			"\nEnvelope lines must match EXACTLY (no trailing stars, no extra spaces, no quotes):" +
+			"\n  First line: *** Begin Patch" +
+			"\n  Last line:  *** End Patch" +
+			"\nWRONG (client rejects): *** Begin Patch ***   or   *** End Patch ***" +
+			"\nRIGHT: *** Begin Patch   and   *** End Patch" +
 			"\nPatch format rules (violations make the patch fail to apply):" +
 			"\n- Every context line and every \"-\" removal line MUST reproduce one ENTIRE line of the target file, byte-exact from first character to last, including all leading indentation. Never quote a fragment of a line." +
 			"\n- To change part of a line, remove the whole original line with \"-\" and add the whole modified line with \"+\"." +
@@ -715,39 +725,152 @@ func (t *callTracker) drop(itemID string) {
 }
 
 func normalizeResponseAfter(raw []byte) ([]byte, error) {
-	var req struct {
-		pluginapi.ResponseTransformRequest
-		HostCallbackID string `json:"host_callback_id,omitempty"`
+	cfg := loadedConfig()
+	if !cfg.Enabled {
+		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+	// Hot path: do not base64-decode OriginalRequest (often 1MB+) on every SSE
+	// text/reasoning delta. Only parse the small fields + Body first.
+	var lite struct {
+		FromFormat string `json:"FromFormat"`
+		ToFormat   string `json:"ToFormat"`
+		Model      string `json:"Model"`
+		Body       []byte `json:"Body"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &lite); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	cfg := loadedConfig()
-	if !cfg.Enabled || len(req.Body) == 0 {
+	if len(lite.Body) == 0 {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	if !strings.EqualFold(req.ToFormat, "openai-response") {
+	if !strings.EqualFold(lite.ToFormat, "openai-response") {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	origModel := gjson.GetBytes(req.OriginalRequest, "model").String()
-	if !responseBackendEnabled(cfg, req.FromFormat, origModel, req.Model) {
+	if !responseBackendEnabled(cfg, lite.FromFormat, lite.Model, lite.Model) {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	if !matchesAny(cfg.Models, origModel) && !matchesAny(cfg.Models, req.Model) {
+	// models:["*"] matches any non-empty model; host Model is enough for the
+	// common path. If Model is empty we only continue when a rewriteable event
+	// forces OriginalRequest load below.
+	if lite.Model != "" && !matchesAny(cfg.Models, lite.Model) {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	names := customToolNames(cfg, req.OriginalRequest)
+
 	var newBody []byte
 	var changed bool
-	if isSSEChunk(req.Body) {
-		newBody, changed = rewriteSSEChunk(req.Body, names)
+	if isSSEChunk(lite.Body) {
+		event := sseEventType(lite.Body)
+		if !sseEventMaybeApplyPatch(event) {
+			return okEnvelope(pluginapi.PayloadResponse{})
+		}
+		// arguments.delta/done only need the in-memory tracker, not tool names
+		// or OriginalRequest. This is the dominant stream volume after a patch
+		// tool call starts, and also skips all non-tracked noise cheaply.
+		if event == "response.function_call_arguments.delta" || event == "response.function_call_arguments.done" {
+			newBody, changed = rewriteSSEChunk(lite.Body, nil)
+		} else {
+			// output_item.* / completed: only load OriginalRequest when the chunk
+			// actually mentions a function_call we might bridge.
+			if event != "response.completed" && !sseChunkHasFunctionCall(lite.Body) {
+				return okEnvelope(pluginapi.PayloadResponse{})
+			}
+			if event == "response.completed" && !bytesContainsFunctionCall(lite.Body) {
+				return okEnvelope(pluginapi.PayloadResponse{})
+			}
+			orig, errOrig := extractOriginalRequest(raw)
+			if errOrig != nil {
+				return nil, errOrig
+			}
+			origModel := gjson.GetBytes(orig, "model").String()
+			if lite.Model == "" && !matchesAny(cfg.Models, origModel) {
+				return okEnvelope(pluginapi.PayloadResponse{})
+			}
+			names := customToolNames(cfg, orig)
+			if len(names) == 0 {
+				return okEnvelope(pluginapi.PayloadResponse{})
+			}
+			newBody, changed = rewriteSSEChunk(lite.Body, names)
+		}
 	} else {
-		newBody, changed = rewriteNonStreamBody(req.Body, names)
+		if !bytesContainsFunctionCall(lite.Body) {
+			return okEnvelope(pluginapi.PayloadResponse{})
+		}
+		orig, errOrig := extractOriginalRequest(raw)
+		if errOrig != nil {
+			return nil, errOrig
+		}
+		origModel := gjson.GetBytes(orig, "model").String()
+		if !matchesAny(cfg.Models, lite.Model) && !matchesAny(cfg.Models, origModel) {
+			return okEnvelope(pluginapi.PayloadResponse{})
+		}
+		names := customToolNames(cfg, orig)
+		if len(names) == 0 {
+			return okEnvelope(pluginapi.PayloadResponse{})
+		}
+		newBody, changed = rewriteNonStreamBody(lite.Body, names)
 	}
 	if !changed {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
 	return okEnvelope(pluginapi.PayloadResponse{Body: newBody})
+}
+
+// extractOriginalRequest base64-decodes only OriginalRequest when a rewrite may
+// need tool declarations. Text deltas never call this.
+func extractOriginalRequest(raw []byte) ([]byte, error) {
+	var wrap struct {
+		OriginalRequest []byte `json:"OriginalRequest"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &wrap); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	return wrap.OriginalRequest, nil
+}
+
+// sseEventType returns the Responses API event name for an SSE chunk, or "".
+func sseEventType(chunk []byte) string {
+	s := string(chunk)
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	if strings.HasPrefix(trimmed, "event:") {
+		if dataIdx := strings.Index(s, "\ndata: "); dataIdx >= 0 {
+			return strings.TrimSpace(s[len("event: "):dataIdx])
+		}
+		// bare event line — no payload this frame
+		line := trimmed
+		if i := strings.IndexByte(line, '\n'); i >= 0 {
+			line = line[:i]
+		}
+		return strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+	}
+	if strings.HasPrefix(trimmed, "data:") {
+		data := strings.TrimSpace(trimmed[len("data:"):])
+		return gjson.Get(data, "type").String()
+	}
+	return ""
+}
+
+func sseEventMaybeApplyPatch(event string) bool {
+	switch event {
+	case "response.output_item.added",
+		"response.function_call_arguments.delta",
+		"response.function_call_arguments.done",
+		"response.output_item.done",
+		"response.completed":
+		return true
+	default:
+		return false
+	}
+}
+
+func sseChunkHasFunctionCall(chunk []byte) bool {
+	// item.type is present on output_item.added/done frames we care about.
+	return strings.Contains(string(chunk), `"type":"function_call"`) ||
+		strings.Contains(string(chunk), `"type": "function_call"`)
+}
+
+func bytesContainsFunctionCall(body []byte) bool {
+	return strings.Contains(string(body), `"type":"function_call"`) ||
+		strings.Contains(string(body), `"type": "function_call"`)
 }
 
 // customToolNames collects (lowercased) the tool names that were bridged for
@@ -883,6 +1006,10 @@ func rewriteSSEChunk(chunk []byte, names map[string]struct{}) ([]byte, bool) {
 		if !ok {
 			return nil, false
 		}
+		// Best-effort stream fix for the common Grok mistake so delta concat
+		// stays close to the normalized done value. Spans that split mid-marker
+		// are still corrected on .done / output_item.done.
+		newPart = patchenv.NormalizeFragments(newPart)
 		payload := map[string]any{
 			"type":            "response.custom_tool_call_input.delta",
 			"sequence_number": gjson.Get(data, "sequence_number").Int(),
@@ -1017,14 +1144,18 @@ func rewriteOutputArray(doc, path string, names map[string]struct{}) (string, bo
 
 // unwrapCustomToolInput mirrors CPA's helper of the same name: the function
 // arguments are {"input": "<raw payload>"}; unwrap to the raw string.
+// apply_patch envelopes are normalized so Codex client verification accepts
+// common model mistakes (trailing "***" on Begin/End lines).
 func unwrapCustomToolInput(arguments string) string {
+	raw := arguments
 	if v := gjson.Get(arguments, "input"); v.Exists() {
 		if v.Type == gjson.String {
-			return v.String()
+			raw = v.String()
+		} else {
+			raw = v.Raw
 		}
-		return v.Raw
 	}
-	return arguments
+	return patchenv.Normalize(raw)
 }
 
 // ---- envelope helpers --------------------------------------------------------

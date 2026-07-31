@@ -5,6 +5,12 @@
 # (media models are skipped). GPT entries are kept byte-identical, so the
 # Codex model picker keeps its full list. Optionally adds
 # multi_agent_version: "v2" to enable the v2 desktop UI pipeline.
+#
+# This file is a snapshot, not a permanent offline cache:
+#   - Source of truth remains CPA /v1/models
+#   - Only capability we must inject is apply_patch_tool_type=freeform
+#   - Re-run after CPA model list / metadata changes (or on a schedule)
+#   - Previous OutFile is copied to OutFile.bak before overwrite
 param(
     [Parameter(Mandatory = $true)][string]$CpaBaseUrl,   # e.g. http://1.2.3.4:8317
     [Parameter(Mandatory = $true)][string]$ApiKey,

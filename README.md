@@ -48,11 +48,15 @@ GPT 系模型走 CPA 原生路径,插件对它们**结构性零干预**:请求�
 
 ### 客户端(Codex CLI / 桌面端)
 
-1. 生成本地模型目录(在装有 Codex 的机器上执行):
+能力上**只需要**给非 GPT 文本模型补 `apply_patch_tool_type: "freeform"`。之所以写成整份 `model_catalog.json`,是因为 Codex 的覆盖入口是完整目录文件,且 CPA 在线 `/v1/models` 会删掉该字段——本地文件是**从 CPA live 目录生成的快照**,不是永久离线百科,权威源仍是 CPA。
+
+1. 从 CPA **重新拉取**并生成/刷新本地目录(在装有 Codex 的机器上执行):
 
    ```powershell
    .\scripts\generate-model-catalog.ps1 -CpaBaseUrl "http://<你的CPA>:8317" -ApiKey "<CPA_API_KEY>"
    ```
+
+   脚本会:请求 CPA live catalog → 给缺少 freeform 的文本模型补上 → 覆盖写入 `~/.codex/model_catalog.json`(旧文件自动 `.bak`)。
 
 2. `~/.codex/config.toml` 增加:
 
@@ -60,7 +64,13 @@ GPT 系模型走 CPA 原生路径,插件对它们**结构性零干预**:请求�
    model_catalog_json = "C:\\Users\\<你>\\.codex\\model_catalog.json"
    ```
 
-3. 重启 Codex,选任意 Claude/Grok 等模型,让它改一个文件——rollout 里应出现 `custom_tool_call name=apply_patch`,桌面端出现差异卡片。
+3. **何时刷新**(务必做,否则模型增删/上下文字段会过期):
+
+   - CPA 上模型列表、上下文窗口或展示信息有变时重跑脚本
+   - 建议:换机初始化时跑一次;之后按需或定时(如每周)重跑同一命令覆盖
+   - 不要手改 catalog 当长期真相源;改完 CPA 后应再生成
+
+4. 重启 Codex,选任意 Claude/Grok 等模型,让它改一个文件——rollout 里应出现 `custom_tool_call name=apply_patch`,桌面端出现差异卡片。
 
 > 差异卡片的「撤销 / 审核」依赖工作区是 **git 仓库**;非 git 目录卡片不渲染,与本插件无关。
 

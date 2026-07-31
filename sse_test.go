@@ -42,6 +42,44 @@ func TestSSEEventType(t *testing.T) {
 	}
 }
 
+func TestPeekResponseNormFieldsSkipsHugeOriginalRequest(t *testing.T) {
+	// Build envelope manually so OriginalRequest is a large base64 blob in the
+	// middle, matching host field order: head fields, OriginalRequest, Body last.
+	huge := make([]byte, 800_000)
+	for i := range huge {
+		huge[i] = 'A'
+	}
+	raw, err := json.Marshal(map[string]any{
+		"FromFormat":        "codex",
+		"ToFormat":          "openai-response",
+		"Model":             "grok-4.5",
+		"Stream":            true,
+		"OriginalRequest":   huge,
+		"TranslatedRequest": []byte(`{}`),
+		"Body":              []byte(`data: {"type":"response.output_text.delta","delta":"ok"}` + "\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, to, model, body, err := peekResponseNormFields(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if from != "codex" || to != "openai-response" || model != "grok-4.5" {
+		t.Fatalf("fields from=%q to=%q model=%q", from, to, model)
+	}
+	if !strings.Contains(string(body), "response.output_text.delta") {
+		t.Fatalf("body peek failed: %q", body)
+	}
+	out, err := normalizeResponseAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payloadBodyFromEnvelope(t, out)) != 0 {
+		t.Fatal("text delta must pass through empty rewrite")
+	}
+}
+
 func TestNormalizeResponseAfterSkipsTextDeltaWithoutOriginalRequest(t *testing.T) {
 	currentConfig.Store(defaultPluginConfig())
 	// Body only; no OriginalRequest field. Old path fully unmarshaled and still

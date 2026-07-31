@@ -49,8 +49,11 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,7 +72,7 @@ import (
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.4.3"
+	pluginVersion = "0.4.4"
 )
 
 type pluginConfig struct {
@@ -78,6 +81,8 @@ type pluginConfig struct {
 	BackendXAI    bool     `yaml:"backend_xai"`
 	Models        []string `yaml:"models"`
 	Tools         []string `yaml:"tools"`
+	// DebugStreamTiming logs per-chunk normalize latency to stderr when true.
+	DebugStreamTiming bool `yaml:"debug_stream_timing"`
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -87,6 +92,7 @@ func defaultPluginConfig() pluginConfig {
 		BackendXAI:    true,
 		Models:        []string{"*"},
 		Tools:         []string{"apply_patch"},
+		DebugStreamTiming: false,
 	}
 }
 
@@ -97,6 +103,7 @@ type configOverlay struct {
 	BackendXAI    *bool    `yaml:"backend_xai"`
 	Models        []string `yaml:"models"`
 	Tools         []string `yaml:"tools"`
+	DebugStreamTiming *bool `yaml:"debug_stream_timing"`
 }
 
 var currentConfig atomic.Value
@@ -232,6 +239,9 @@ func configure(raw []byte) error {
 		if overlay.BackendXAI != nil {
 			cfg.BackendXAI = *overlay.BackendXAI
 		}
+		if overlay.DebugStreamTiming != nil {
+			cfg.DebugStreamTiming = *overlay.DebugStreamTiming
+		}
 		// Explicit empty models/tools lists match nothing (fail-closed).
 		// Absent keys keep defaults from defaultPluginConfig.
 		if overlay.Models != nil {
@@ -295,6 +305,7 @@ func pluginRegistration() registration {
 				{Name: "backend_xai", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：xAI / Grok。开启后，对 grok* 模型在进入 xAI 执行器前桥接 apply_patch（CPA 会硬删除 type=custom name=apply_patch）。默认开启。不影响 GPT/OpenAI codex 原生路径。"},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "模型名过滤（可与后端勾选叠加）。支持前缀通配，如 grok*、claude*；* 表示不额外限制模型名。默认 [\"*\"]。非 GPT 模型还须在客户端 model_catalog_json 补 apply_patch_tool_type: freeform。"},
 				{Name: "tools", Type: pluginapi.ConfigFieldTypeArray, Description: "桥接哪些 Codex freeform(custom) 工具。默认 [\"apply_patch\"]；填 * 表示客户端声明的所有 custom 工具都桥接。"},
+				{Name: "debug_stream_timing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "调试：把 response.normalize_after 每片耗时汇总打到 CPA stderr（avg/max）。默认关闭。"},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -729,37 +740,35 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 	if !cfg.Enabled {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	// Hot path: do not base64-decode OriginalRequest (often 1MB+) on every SSE
-	// text/reasoning delta. Only parse the small fields + Body first.
-	var lite struct {
-		FromFormat string `json:"FromFormat"`
-		ToFormat   string `json:"ToFormat"`
-		Model      string `json:"Model"`
-		Body       []byte `json:"Body"`
+	start := time.Now()
+	// Hot path must NOT json.Unmarshal the whole envelope: OriginalRequest is
+	// often 1MB+ base64 and sits before Body. Peek small head fields + Body
+	// from the end (Body is last in host marshal order).
+	fromFormat, toFormat, model, body, errPeek := peekResponseNormFields(raw)
+	if errPeek != nil {
+		return nil, errPeek
 	}
-	if errUnmarshal := json.Unmarshal(raw, &lite); errUnmarshal != nil {
-		return nil, errUnmarshal
-	}
-	if len(lite.Body) == 0 {
+	defer noteStreamTiming(cfg, time.Since(start))
+	if len(body) == 0 {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	if !strings.EqualFold(lite.ToFormat, "openai-response") {
+	if !strings.EqualFold(toFormat, "openai-response") {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
-	if !responseBackendEnabled(cfg, lite.FromFormat, lite.Model, lite.Model) {
+	if !responseBackendEnabled(cfg, fromFormat, model, model) {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
 	// models:["*"] matches any non-empty model; host Model is enough for the
 	// common path. If Model is empty we only continue when a rewriteable event
 	// forces OriginalRequest load below.
-	if lite.Model != "" && !matchesAny(cfg.Models, lite.Model) {
+	if model != "" && !matchesAny(cfg.Models, model) {
 		return okEnvelope(pluginapi.PayloadResponse{})
 	}
 
 	var newBody []byte
 	var changed bool
-	if isSSEChunk(lite.Body) {
-		event := sseEventType(lite.Body)
+	if isSSEChunk(body) {
+		event := sseEventType(body)
 		if !sseEventMaybeApplyPatch(event) {
 			return okEnvelope(pluginapi.PayloadResponse{})
 		}
@@ -767,14 +776,14 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 		// or OriginalRequest. This is the dominant stream volume after a patch
 		// tool call starts, and also skips all non-tracked noise cheaply.
 		if event == "response.function_call_arguments.delta" || event == "response.function_call_arguments.done" {
-			newBody, changed = rewriteSSEChunk(lite.Body, nil)
+			newBody, changed = rewriteSSEChunk(body, nil)
 		} else {
 			// output_item.* / completed: only load OriginalRequest when the chunk
 			// actually mentions a function_call we might bridge.
-			if event != "response.completed" && !sseChunkHasFunctionCall(lite.Body) {
+			if event != "response.completed" && !sseChunkHasFunctionCall(body) {
 				return okEnvelope(pluginapi.PayloadResponse{})
 			}
-			if event == "response.completed" && !bytesContainsFunctionCall(lite.Body) {
+			if event == "response.completed" && !bytesContainsFunctionCall(body) {
 				return okEnvelope(pluginapi.PayloadResponse{})
 			}
 			orig, errOrig := extractOriginalRequest(raw)
@@ -782,17 +791,17 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 				return nil, errOrig
 			}
 			origModel := gjson.GetBytes(orig, "model").String()
-			if lite.Model == "" && !matchesAny(cfg.Models, origModel) {
+			if model == "" && !matchesAny(cfg.Models, origModel) {
 				return okEnvelope(pluginapi.PayloadResponse{})
 			}
 			names := customToolNames(cfg, orig)
 			if len(names) == 0 {
 				return okEnvelope(pluginapi.PayloadResponse{})
 			}
-			newBody, changed = rewriteSSEChunk(lite.Body, names)
+			newBody, changed = rewriteSSEChunk(body, names)
 		}
 	} else {
-		if !bytesContainsFunctionCall(lite.Body) {
+		if !bytesContainsFunctionCall(body) {
 			return okEnvelope(pluginapi.PayloadResponse{})
 		}
 		orig, errOrig := extractOriginalRequest(raw)
@@ -800,14 +809,14 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 			return nil, errOrig
 		}
 		origModel := gjson.GetBytes(orig, "model").String()
-		if !matchesAny(cfg.Models, lite.Model) && !matchesAny(cfg.Models, origModel) {
+		if !matchesAny(cfg.Models, model) && !matchesAny(cfg.Models, origModel) {
 			return okEnvelope(pluginapi.PayloadResponse{})
 		}
 		names := customToolNames(cfg, orig)
 		if len(names) == 0 {
 			return okEnvelope(pluginapi.PayloadResponse{})
 		}
-		newBody, changed = rewriteNonStreamBody(lite.Body, names)
+		newBody, changed = rewriteNonStreamBody(body, names)
 	}
 	if !changed {
 		return okEnvelope(pluginapi.PayloadResponse{})
@@ -815,16 +824,145 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.PayloadResponse{Body: newBody})
 }
 
+// peekResponseNormFields reads FromFormat/ToFormat/Model/Body without decoding
+// OriginalRequest. Body is located from the end (host marshals it last).
+func peekResponseNormFields(raw []byte) (fromFormat, toFormat, model string, body []byte, err error) {
+	fromFormat, _ = jsonStringField(raw, "FromFormat")
+	toFormat, _ = jsonStringField(raw, "ToFormat")
+	model, _ = jsonStringField(raw, "Model")
+	body, err = jsonBytesFieldLast(raw, "Body")
+	return fromFormat, toFormat, model, body, err
+}
+
+// jsonStringField finds `"Key":"..."` near the start of the object (small fields).
+func jsonStringField(raw []byte, key string) (string, bool) {
+	needle := []byte(`"` + key + `":"`)
+	i := bytes.Index(raw, needle)
+	if i < 0 {
+		needle = []byte(`"` + key + `": "`)
+		i = bytes.Index(raw, needle)
+		if i < 0 {
+			return "", false
+		}
+	}
+	start := i + len(needle)
+	end, ok := jsonStringEnd(raw, start)
+	if !ok {
+		return "", false
+	}
+	s, errUnquote := strconv.Unquote(`"` + string(raw[start:end]) + `"`)
+	if errUnquote != nil {
+		// field values for formats/models are plain ASCII without escapes
+		return string(raw[start:end]), true
+	}
+	return s, true
+}
+
+// jsonBytesFieldLast finds the last `"Key":"<base64>"` (Body is last field).
+func jsonBytesFieldLast(raw []byte, key string) ([]byte, error) {
+	needle := []byte(`"` + key + `":"`)
+	i := bytes.LastIndex(raw, needle)
+	if i < 0 {
+		needle = []byte(`"` + key + `": "`)
+		i = bytes.LastIndex(raw, needle)
+		if i < 0 {
+			return nil, nil
+		}
+	}
+	start := i + len(needle)
+	end, ok := jsonStringEnd(raw, start)
+	if !ok {
+		return nil, fmt.Errorf("truncated JSON string for %s", key)
+	}
+	// encoding/json encodes []byte as standard base64
+	out := make([]byte, base64.StdEncoding.DecodedLen(end-start))
+	n, errDecode := base64.StdEncoding.Decode(out, raw[start:end])
+	if errDecode != nil {
+		return nil, errDecode
+	}
+	return out[:n], nil
+}
+
+func jsonStringEnd(raw []byte, start int) (int, bool) {
+	for i := start; i < len(raw); i++ {
+		c := raw[i]
+		if c == '\\' {
+			i++
+			continue
+		}
+		if c == '"' {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // extractOriginalRequest base64-decodes only OriginalRequest when a rewrite may
 // need tool declarations. Text deltas never call this.
 func extractOriginalRequest(raw []byte) ([]byte, error) {
-	var wrap struct {
-		OriginalRequest []byte `json:"OriginalRequest"`
+	// First occurrence; sits before the huge value so Index stops early on the key.
+	out, err := jsonBytesFieldFirst(raw, "OriginalRequest")
+	if err != nil {
+		return nil, err
 	}
-	if errUnmarshal := json.Unmarshal(raw, &wrap); errUnmarshal != nil {
-		return nil, errUnmarshal
+	return out, nil
+}
+
+func jsonBytesFieldFirst(raw []byte, key string) ([]byte, error) {
+	needle := []byte(`"` + key + `":"`)
+	i := bytes.Index(raw, needle)
+	if i < 0 {
+		needle = []byte(`"` + key + `": "`)
+		i = bytes.Index(raw, needle)
+		if i < 0 {
+			return nil, nil
+		}
 	}
-	return wrap.OriginalRequest, nil
+	start := i + len(needle)
+	end, ok := jsonStringEnd(raw, start)
+	if !ok {
+		return nil, fmt.Errorf("truncated JSON string for %s", key)
+	}
+	out := make([]byte, base64.StdEncoding.DecodedLen(end-start))
+	n, errDecode := base64.StdEncoding.Decode(out, raw[start:end])
+	if errDecode != nil {
+		return nil, errDecode
+	}
+	return out[:n], nil
+}
+
+// streamTimingAgg is updated only when debug_stream_timing is enabled.
+var streamTimingAgg struct {
+	mu      sync.Mutex
+	count   int64
+	sumNs   int64
+	maxNs   int64
+	lastLog time.Time
+}
+
+func noteStreamTiming(cfg pluginConfig, d time.Duration) {
+	if !cfg.DebugStreamTiming {
+		return
+	}
+	ns := d.Nanoseconds()
+	streamTimingAgg.mu.Lock()
+	defer streamTimingAgg.mu.Unlock()
+	streamTimingAgg.count++
+	streamTimingAgg.sumNs += ns
+	if ns > streamTimingAgg.maxNs {
+		streamTimingAgg.maxNs = ns
+	}
+	now := time.Now()
+	if streamTimingAgg.count < 200 && now.Sub(streamTimingAgg.lastLog) < 2*time.Second {
+		return
+	}
+	avg := streamTimingAgg.sumNs / streamTimingAgg.count
+	fmt.Fprintf(os.Stderr, "[cpa-apply-patch] stream_timing n=%d avg_us=%d max_us=%d\n",
+		streamTimingAgg.count, avg/1000, streamTimingAgg.maxNs/1000)
+	streamTimingAgg.count = 0
+	streamTimingAgg.sumNs = 0
+	streamTimingAgg.maxNs = 0
+	streamTimingAgg.lastLog = now
 }
 
 // sseEventType returns the Responses API event name for an SSE chunk, or "".

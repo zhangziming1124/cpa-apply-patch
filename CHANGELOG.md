@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.4 — 2026-07-31
+
+- **流式热路径再抠**：文本/推理 SSE 帧不再对整个 normalize 信封做 json.Unmarshal。字节扫描读取头字段，并从尾部定位 Body（宿主字段顺序下 Body 在最后），避免扫过大段 OriginalRequest base64。
+- 新增配置 debug_stream_timing：开启后把 normalize 耗时 avg/max 打到 CPA stderr，便于对照 per-chunk 开销。
+- OriginalRequest 仅在真正需要改写 apply_patch 时按字段名抽取解码。
+
 ## v0.4.3 — 2026-07-30
 
 - **流式出字卡顿修复**：`response.normalize_after` 热路径不再在每个 SSE 文本/推理 delta 上 base64 反序列化整份 `OriginalRequest`（常 1MB+）。先解析小字段 + `Body`，非 `function_call*` 相关事件立即透传；仅在可能改写 apply_patch 的帧上才加载 tools 名单。

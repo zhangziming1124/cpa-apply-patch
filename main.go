@@ -4,12 +4,18 @@
 // Backend toggles (management panel checkboxes):
 //   - backend_claude: bridge when ToFormat=claude
 //   - backend_xai:    bridge when ToFormat=codex and model is Grok/xAI
-//                     (xAI executor hard-deletes type=custom name=apply_patch)
+//     (xAI executor hard-deletes type=custom name=apply_patch)
+//   - backend_gemini: bridge when ToFormat=antigravity (Google OAuth) or gemini
+//     (Gemini CLI). CPA only converts type=function tools into
+//     Gemini functionDeclarations, so custom apply_patch is dropped.
+//
 // True OpenAI/codex GPT paths stay untouched.
 //
 // Request side converts custom tools to {"input": string} function tools before
-// the upstream translator/executor runs. Response side restores custom_tool_call
-// events. Non-GPT clients still need model_catalog_json freeform declarations.
+// the upstream translator/executor runs, and flattens Codex agent_message items
+// for Grok (xAI ModelInput rejects them with HTTP 422). Response side restores
+// custom_tool_call events. Non-GPT clients still need model_catalog_json freeform
+// declarations.
 package main
 
 /*
@@ -72,13 +78,14 @@ import (
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.4.4"
+	pluginVersion = "0.4.6"
 )
 
 type pluginConfig struct {
 	Enabled       bool     `yaml:"enabled"`
 	BackendClaude bool     `yaml:"backend_claude"`
 	BackendXAI    bool     `yaml:"backend_xai"`
+	BackendGemini bool     `yaml:"backend_gemini"`
 	Models        []string `yaml:"models"`
 	Tools         []string `yaml:"tools"`
 	// DebugStreamTiming logs per-chunk normalize latency to stderr when true.
@@ -87,23 +94,25 @@ type pluginConfig struct {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		Enabled:       true,
-		BackendClaude: true,
-		BackendXAI:    true,
-		Models:        []string{"*"},
-		Tools:         []string{"apply_patch"},
+		Enabled:           true,
+		BackendClaude:     true,
+		BackendXAI:        true,
+		BackendGemini:     true,
+		Models:            []string{"*"},
+		Tools:             []string{"apply_patch"},
 		DebugStreamTiming: false,
 	}
 }
 
 // configOverlay lets absent boolean keys keep defaults instead of yaml false.
 type configOverlay struct {
-	Enabled       *bool    `yaml:"enabled"`
-	BackendClaude *bool    `yaml:"backend_claude"`
-	BackendXAI    *bool    `yaml:"backend_xai"`
-	Models        []string `yaml:"models"`
-	Tools         []string `yaml:"tools"`
-	DebugStreamTiming *bool `yaml:"debug_stream_timing"`
+	Enabled           *bool    `yaml:"enabled"`
+	BackendClaude     *bool    `yaml:"backend_claude"`
+	BackendXAI        *bool    `yaml:"backend_xai"`
+	BackendGemini     *bool    `yaml:"backend_gemini"`
+	Models            []string `yaml:"models"`
+	Tools             []string `yaml:"tools"`
+	DebugStreamTiming *bool    `yaml:"debug_stream_timing"`
 }
 
 var currentConfig atomic.Value
@@ -239,6 +248,9 @@ func configure(raw []byte) error {
 		if overlay.BackendXAI != nil {
 			cfg.BackendXAI = *overlay.BackendXAI
 		}
+		if overlay.BackendGemini != nil {
+			cfg.BackendGemini = *overlay.BackendGemini
+		}
 		if overlay.DebugStreamTiming != nil {
 			cfg.DebugStreamTiming = *overlay.DebugStreamTiming
 		}
@@ -302,7 +314,8 @@ func pluginRegistration() registration {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "总开关。关闭后停止全部改写，客户端将退回命令行改文件（插件仍保持加载）。"},
 				{Name: "backend_claude", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：Claude。开启后，上游格式为 claude 时桥接 apply_patch（CPA 会丢弃 freeform custom 工具）。默认开启。"},
-				{Name: "backend_xai", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：xAI / Grok。开启后，对 grok* 模型在进入 xAI 执行器前桥接 apply_patch（CPA 会硬删除 type=custom name=apply_patch）。默认开启。不影响 GPT/OpenAI codex 原生路径。"},
+				{Name: "backend_xai", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：xAI / Grok。开启后，对 grok* 模型桥接 apply_patch，并把 Codex 子 agent 的 agent_message 摊成普通 message（避免 Grok ModelInput 422）。默认开启。不影响 GPT/OpenAI codex 原生路径。"},
+				{Name: "backend_gemini", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：Gemini / Antigravity。开启后，上游格式为 antigravity（Google 账号 OAuth）或 gemini（Gemini CLI）时桥接 apply_patch。CPA 只把 type=function 转成 functionDeclarations，custom apply_patch 会被静默丢掉。默认开启。"},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "模型名过滤（可与后端勾选叠加）。支持前缀通配，如 grok*、claude*；* 表示不额外限制模型名。默认 [\"*\"]。非 GPT 模型还须在客户端 model_catalog_json 补 apply_patch_tool_type: freeform。"},
 				{Name: "tools", Type: pluginapi.ConfigFieldTypeArray, Description: "桥接哪些 Codex freeform(custom) 工具。默认 [\"apply_patch\"]；填 * 表示客户端声明的所有 custom 工具都桥接。"},
 				{Name: "debug_stream_timing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "调试：把 response.normalize_after 每片耗时汇总打到 CPA stderr（avg/max）。默认关闭。"},
@@ -364,6 +377,10 @@ func requestBackendEnabled(cfg pluginConfig, toFormat, requestedModel, execModel
 		// xAI reuses the codex wire format. Only bridge Grok/xAI models so
 		// true OpenAI/codex GPT paths keep native freeform apply_patch.
 		return cfg.BackendXAI && (isXAIModel(requestedModel) || isXAIModel(execModel) || isXAIModel(gjson.GetBytes(body, "model").String()))
+	case "gemini", "antigravity":
+		// Gemini CLI uses ToFormat=gemini; Google-account OAuth uses antigravity.
+		// Both wrap ConvertOpenAIResponsesRequestToGemini, which only keeps type=function.
+		return cfg.BackendGemini
 	default:
 		return false
 	}
@@ -378,6 +395,8 @@ func responseBackendEnabled(cfg pluginConfig, fromFormat, modelA, modelB string)
 		return cfg.BackendClaude
 	case "codex", "openai-response":
 		return cfg.BackendXAI && (isXAIModel(modelA) || isXAIModel(modelB))
+	case "gemini", "antigravity":
+		return cfg.BackendGemini
 	default:
 		return false
 	}
@@ -391,7 +410,6 @@ func isXAIModel(model string) bool {
 	}
 	return strings.HasPrefix(model, "grok") || strings.Contains(model, "grok-")
 }
-
 
 func rewriteRequestBody(cfg pluginConfig, body []byte) ([]byte, bool) {
 	changed := false
@@ -469,10 +487,71 @@ func rewriteRequestBody(cfg pluginConfig, body []byte) ([]byte, bool) {
 					body = next
 					changed = true
 				}
+			case "agent_message":
+				// Codex multi-agent history. xAI's Responses ModelInput enum
+				// rejects type=agent_message (HTTP 422). Flatten to a normal
+				// user message so Grok can still see the task text.
+				raw, errMarshal := json.Marshal(agentMessageAsUserMessage(item))
+				if errMarshal != nil {
+					continue
+				}
+				if next, errSet := sjson.SetRawBytes(body, fmt.Sprintf("input.%d", i), raw); errSet == nil {
+					body = next
+					changed = true
+				}
 			}
 		}
 	}
 	return body, changed
+}
+
+// agentMessageAsUserMessage converts a Codex collaboration agent_message item
+// into a plain Responses message that xAI can deserialize.
+func agentMessageAsUserMessage(item gjson.Result) map[string]any {
+	msg := map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []map[string]string{
+			{
+				"type": "input_text",
+				"text": flattenAgentMessageText(item),
+			},
+		},
+	}
+	if id := strings.TrimSpace(item.Get("id").String()); id != "" {
+		msg["id"] = id
+	}
+	return msg
+}
+
+// flattenAgentMessageText joins author/recipient metadata and content parts.
+// Desktop currently places the task plaintext in encrypted_content parts.
+func flattenAgentMessageText(item gjson.Result) string {
+	var b strings.Builder
+	author := strings.TrimSpace(item.Get("author").String())
+	recipient := strings.TrimSpace(item.Get("recipient").String())
+	fmt.Fprintf(&b, "[agent_message author=%s recipient=%s]", author, recipient)
+	for _, part := range item.Get("content").Array() {
+		var piece string
+		switch part.Get("type").String() {
+		case "input_text", "output_text", "text":
+			piece = part.Get("text").String()
+		case "encrypted_content":
+			piece = part.Get("encrypted_content").String()
+			if piece == "" {
+				piece = part.Get("text").String()
+			}
+		default:
+			continue
+		}
+		piece = strings.TrimRight(piece, "\r\n")
+		if piece == "" {
+			continue
+		}
+		b.WriteByte('\n')
+		b.WriteString(piece)
+	}
+	return b.String()
 }
 
 func customToolAsFunction(name, description string) map[string]any {

@@ -7,6 +7,7 @@ plugins:
       # 后端服务勾选（管理面板布尔开关）
       backend_claude: true   # Claude 上游
       backend_xai: true      # xAI / Grok（grok* 模型）
+      backend_gemini: true   # Gemini / Antigravity
       # 模型名过滤，可与后端勾选叠加；* = 不额外限制
       models:
         - "*"

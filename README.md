@@ -13,6 +13,7 @@ Codex 客户端通过 CPA 调 Claude 等第三方模型时,**apply_patch 工具�
 | ① 模型目录 | `internal/client/codex/models/models.go:254` | `/v1/models?client_version` 下发目录时,凡是不在 GPT 模板列表里的模型,一律 `delete(entry, "apply_patch_tool_type")`,客户端因此不启用 apply_patch(有单测把该行为固化为预期) |
 | ② 请求翻译 | `internal/translator/claude/openai/responses/claude_openai-responses_request.go:632-648` | OpenAI Responses → Claude 方向,`type=custom, name=apply_patch` 的工具定义被**点名丢弃**;`custom_tool_call(_output)` 历史项无对应分支,静默丢失 |
 | ③ 响应翻译 | `internal/translator/claude/openai/responses/claude_openai-responses_response.go` | Claude → OpenAI Responses 方向,所有 `tool_use` 一律译成 `function_call`,永远不产生桌面端渲染差异卡所需的 `custom_tool_call` 事件 |
+| ②′ Gemini | `internal/translator/gemini/openai/responses/gemini_openai-responses_request.go` | OpenAI Responses → Gemini/Antigravity 只把 `type=function` 转成 `functionDeclarations`,`type=custom` 的 apply_patch **静默丢掉**(v7.2.137 仍如此) |
 
 本插件不改 CPA 源码、不换官方二进制,用 CPA 自带的插件系统(C ABI 动态库,官方发行版原生支持)把三层逐一打通:
 
@@ -20,7 +21,7 @@ Codex 客户端通过 CPA 调 Claude 等第三方模型时,**apply_patch 工具�
 - **③ 响应方向** — `ResponseAfterTranslator` 把翻译产物里这些工具的 `function_call` 事件族改写回 `custom_tool_call` 事件族(`output_item.added` / `custom_tool_call_input.delta` / `.done` / `output_item.done` / `response.completed`),流式 delta 经增量 JSON 字符串解码,**保证 delta 累加与 done 值逐字节一致**,符合官方 Responses API 语义。
 - **① 目录层在客户端解决** — CPA 的目录响应链没有插件挂点,但 Codex 客户端支持 `model_catalog_json` 本地目录覆盖:用 [`scripts/generate-model-catalog.ps1`](scripts/generate-model-catalog.ps1) 从你的 CPA 拉取全量目录、给文本模型补上 `apply_patch_tool_type: "freeform"`,模型保持**真实身份与真实上下文窗口**(不借用 GPT 档案)。
 
-GPT 系模型走 CPA 原生路径,插件对它们**结构性零干预**:请求改写挂在 AfterAuth 钩子上并只对 `ToFormat=claude` 的请求生效,响应改写只对 claude→openai-response 翻译对生效——codex/xai 等原生支持 custom 工具的上游无论配置怎么写都不会被触碰(OpenAI 兼容上游只缺目录字段,由客户端目录一并补齐)。
+GPT 系模型走 CPA 原生路径,插件对它们**结构性零干预**:请求改写挂在 AfterAuth 钩子上,只对勾选的后端生效——`ToFormat=claude`、`antigravity`/`gemini`,以及 `ToFormat=codex` 且模型为 grok*。GPT 的 codex 原生路径无论配置怎么写都不会被触碰(OpenAI 兼容上游只缺目录字段,由客户端目录一并补齐)。
 
 ## 安装
 
@@ -38,10 +39,13 @@ GPT 系模型走 CPA 原生路径,插件对它们**结构性零干预**:请求�
    plugins:
      enabled: true
      configs:
-       cpa-apply-patch:
-         enabled: true
-         models: ["*"]            # 为哪些模型桥接;支持前缀通配 claude*、grok*
-         tools: ["apply_patch"]   # 桥接哪些 freeform 工具;* = 全部 custom 工具
+      cpa-apply-patch:
+        enabled: true
+        backend_claude: true
+        backend_xai: true
+        backend_gemini: true      # Gemini / Antigravity
+        models: ["*"]            # 为哪些模型桥接;支持前缀通配 claude*、grok*
+        tools: ["apply_patch"]   # 桥接哪些 freeform 工具;* = 全部 custom 工具
    ```
 
    完整示例见 [`configs/cpa-config.example.yaml`](configs/cpa-config.example.yaml)。
@@ -70,7 +74,7 @@ GPT 系模型走 CPA 原生路径,插件对它们**结构性零干预**:请求�
    - 建议:换机初始化时跑一次;之后按需或定时(如每周)重跑同一命令覆盖
    - 不要手改 catalog 当长期真相源;改完 CPA 后应再生成
 
-4. 重启 Codex,选任意 Claude/Grok 等模型,让它改一个文件——rollout 里应出现 `custom_tool_call name=apply_patch`,桌面端出现差异卡片。
+4. 重启 Codex,选任意 Claude/Grok/Gemini 等模型,让它改一个文件——rollout 里应出现 `custom_tool_call name=apply_patch`,桌面端出现差异卡片。
 
 > 差异卡片的「撤销 / 审核」依赖工作区是 **git 仓库**;非 git 目录卡片不渲染,与本插件无关。
 
@@ -89,6 +93,8 @@ Linux/macOS 直接 `make build VERSION=0.2.1`。
 - **补丁行级精度依赖模型**:工具描述里内置了格式硬规则(上下文行整行逐字节复制、含缩进),但这属于提示级约束。注意 apply_patch 执行器对缩进不符的补丁会**模糊匹配并按补丁字面缩进静默落盘**(不报错),Python/YAML 等缩进敏感文件需留意。
 - **信封行尾部星号(v0.4.2 已兜底)**:Grok 等模型常输出 `*** Begin Patch ***` / `*** End Patch ***`,Codex 要求首行恰好是 `*** Begin Patch`。插件在响应改写时归一化信封行,避免 verification failed 后退回 shell 写盘。
 - **不支持 code mode**:`tool_mode: code_mode_only`(GPT-5.6 系的 JS 工具调用形态)在非 GPT 模型上会被客户端 harness 拒绝,请勿在本地目录里给非 GPT 模型设置该字段。
+- **Grok + Codex 子 agent(v0.4.5 已兜底)**:Codex 会把 `agent_message` 写进 Responses `input`,xAI 反序列化 `ModelInput` 时报 HTTP 422。插件在 Grok 路径把该项摊成普通 `message`,任务正文仍可见,但不是完整 multi-agent 协议语义。
+- **Gemini 缺 apply_patch(v0.4.6 已兜底)**:Antigravity OAuth 与 Gemini CLI 翻译器只转发 `type=function`,custom apply_patch 会被静默丢掉。勾选 `backend_gemini`(默认开)后与 Claude/Grok 同一条桥。
 - CPA 升级若变更插件 ABI(当前 v1),需按新 SDK 重新编译。
 
 ## 目录结构

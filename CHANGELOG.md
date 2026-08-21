@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.6 — 2026-08-21
+
+- **Gemini / Antigravity 原生 apply_patch 桥接**：新增 `backend_gemini` 勾选（默认开）。CPA 的 OpenAI Responses → Gemini/Antigravity 翻译器只把 `type=function` 转成 `functionDeclarations`，`type=custom` 的 apply_patch 会被静默丢掉。请求侧在 `ToFormat=antigravity|gemini` 时先改成 `{input:string}` function；响应侧把 `FromFormat=antigravity|gemini` 的 `function_call` 改回 `custom_tool_call`。覆盖 Google 账号 OAuth（Antigravity）和 Gemini CLI 两条上游。GPT 原生路径仍不碰。
+
+## v0.4.5 — 2026-08-04
+
+- **Grok + Codex 子 agent 422 修复**：请求侧把 `input[]` 中的 `agent_message` 摊成普通 `message`（`role=user`），并把 content 里的 `input_text` / `encrypted_content` 拼成可读正文。xAI Responses 的 `ModelInput` 不认识 `agent_message`，会直接 HTTP 422（`data did not match any variant of untagged enum ModelInput`）；仅在 `backend_xai` + grok* 路径生效，GPT 原生路径不动。
+- 与既有 apply_patch 历史桥接可同请求共存；单独只有 `agent_message` 时也会标记 body changed。
+
 ## v0.4.4 — 2026-07-31
 
 - **流式热路径再抠**：文本/推理 SSE 帧不再对整个 normalize 信封做 json.Unmarshal。字节扫描读取头字段，并从尾部定位 Body（宿主字段顺序下 Body 在最后），避免扫过大段 OriginalRequest base64。

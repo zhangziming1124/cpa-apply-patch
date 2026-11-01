@@ -57,6 +57,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -395,6 +396,16 @@ func interceptRequestAfterAuth(raw []byte) ([]byte, error) {
 		}
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
+	// Client gate: the bridge only serves Codex clients. The client-sent
+	// User-Agent carries an identifying "codex" token (Codex CLI / Codex
+	// Desktop). Requests without a recognizable UA pass through untouched so
+	// third-party Responses clients are never fingerprint-scanned.
+	if !codexClientUserAgent(req.Headers) {
+		if req.RequestID != "" {
+			streamStates.drop(req.RequestID)
+		}
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	}
 	// Codex freeform tools only arrive on the OpenAI Responses protocol.
 	if !strings.EqualFold(strings.TrimSpace(req.SourceFormat), "openai-response") {
 		if req.RequestID != "" {
@@ -430,6 +441,25 @@ func interceptRequestAfterAuth(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	return okEnvelope(pluginapi.RequestInterceptResponse{Body: newBody})
+}
+
+// codexClientUserAgent reports whether the client identifies itself as Codex.
+// Codex CLI / Codex Desktop send a User-Agent containing the token "codex"
+// (case-insensitive), e.g. "codex_cli_rs/0.4x" or
+// "Codex Desktop/0.164.0 ...". A missing User-Agent conservatively passes:
+// the protocol, backend, and model gates below still apply, and custom tools
+// only exist on the Responses protocol anyway. Requests with a UA that does
+// not mention codex (third-party Responses clients, OpenRouter frontends)
+// pass through untouched — no fingerprint scanning, no bridge, no state.
+func codexClientUserAgent(headers http.Header) bool {
+	if headers == nil {
+		return true
+	}
+	ua := strings.TrimSpace(headers.Get("User-Agent"))
+	if ua == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(ua), "codex")
 }
 
 // modelEnabled reports whether this request's model is configured for Codex

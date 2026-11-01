@@ -194,3 +194,75 @@ func TestResponsesClientWithPlainFunctionToolsUntouched(t *testing.T) {
 		t.Fatalf("foreign function_call delta must pass through, got %s", b)
 	}
 }
+
+// The client gate: requests whose User-Agent does not identify as Codex pass
+// through even on the Responses protocol with a fingerprintable function
+// tool. Codex-flavored UAs proceed to the protocol gate. Missing/empty UA
+// conservatively proceeds (older gate semantics).
+func TestUserAgentGate(t *testing.T) {
+	currentConfig.Store(defaultPluginConfig())
+	bridgable := []byte(`{"model":"glm-5.3","tools":[{"type":"custom","name":"apply_patch","description":"x"}],"input":[]}`)
+
+	mk := func(ua string) []byte {
+		var hdrs map[string][]string
+		if ua != "" {
+			hdrs = map[string][]string{"User-Agent": {ua}}
+		}
+		raw, err := json.Marshal(map[string]any{
+			"RequestID":      "req-ua-" + ua,
+			"SourceFormat":   "openai-response",
+			"ToFormat":       "claude",
+			"Model":          "claude-opus-5",
+			"RequestedModel": "claude-opus-5",
+			"Stream":         true,
+			"Headers":        hdrs,
+			"Body":           bridgable,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	// Non-Codex UA: no rewrite, no state recorded.
+	out, err := interceptRequestAfterAuth(mk("OpenRouter-Frontend/1.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := passthroughResult(t, out); len(body) != 0 {
+		t.Fatalf("non-Codex UA must pass through, got %s", body)
+	}
+	if _, ok := streamStates.get("req-ua-OpenRouter-Frontend/1.0"); ok {
+		t.Fatal("non-Codex UA must not record stream state")
+	}
+
+	// Codex CLI UA: proceeds (state recorded — the bridge is engaged).
+	out, err = interceptRequestAfterAuth(mk("codex_cli_rs/0.45.0 (Ubuntu; x86_64)"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := streamStates.get("req-ua-codex_cli_rs/0.45.0 (Ubuntu; x86_64)"); !ok {
+		t.Fatal("Codex CLI UA should engage the bridge (state recorded)")
+	}
+
+	// Codex Desktop UA (capital C): case-insensitive match.
+	out, err = interceptRequestAfterAuth(mk("Codex Desktop/0.164.0-alpha (Windows)"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := streamStates.get("req-ua-Codex Desktop/0.164.0-alpha (Windows)"); !ok {
+		t.Fatal("Codex Desktop UA should engage the bridge")
+	}
+
+	// Missing User-Agent: conservative pass-through to protocol gates.
+	raw := mk("")
+	var env map[string]any
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	delete(env, "Headers")
+	raw, _ = json.Marshal(env)
+	if _, err := interceptRequestAfterAuth(raw); err != nil {
+		t.Fatal(err)
+	}
+}

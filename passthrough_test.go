@@ -151,3 +151,46 @@ func TestStreamChunkHeaderInitStaysNoopForNonResponses(t *testing.T) {
 		t.Fatalf("header-init must be a no-op, got %q", body)
 	}
 }
+
+// A third-party Responses client (not Codex) uses ordinary JSON function
+// tools — no freeform custom tools. It passes the protocol gate, yet the
+// semantic gates below it (type=custom match, bridge fingerprint) cannot
+// fire: the request rewrite is a no-op, no bridged names are recorded, and
+// the response side is inert on empty names. This pins "no problem exists,
+// plugin provably no-op" for today's mainstream non-Codex Responses clients.
+func TestResponsesClientWithPlainFunctionToolsUntouched(t *testing.T) {
+	currentConfig.Store(defaultPluginConfig())
+	requestID := "req-fn-tools"
+	body := []byte(`{"model":"claude-opus-5","tools":[{"type":"function","name":"edit_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	raw := requestInterceptEnvelope(t, requestID, "openai-response", "claude", "claude-opus-5", body)
+	out, err := interceptRequestAfterAuth(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewritten := passthroughResult(t, out); len(rewritten) != 0 {
+		t.Fatalf("function-tool Responses client must not be rewritten, got %s", rewritten)
+	}
+	if state, ok := streamStates.get(requestID); ok && len(state.names) != 0 {
+		t.Fatalf("no bridged names may be recorded, got %v", state.names)
+	}
+
+	// Response side: a function_call for the client's own tool passes through.
+	chunk := []byte(`data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_1","name":"edit_file"}}`)
+	outChunk, err := interceptStreamChunk(streamChunkEnvelope(t, requestID, "openai-response", 2, chunk, "claude-opus-5"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := chunkBodyFromEnvelope(t, outChunk); len(b) != 0 {
+		t.Fatalf("foreign function_call must pass through, got %s", b)
+	}
+
+	// Its arguments deltas too (the tracker never learned this item id).
+	delta := []byte(`data: {"type":"response.function_call_arguments.delta","sequence_number":2,"output_index":0,"item_id":"fc_1","delta":"x"}`)
+	outDelta, err := interceptStreamChunk(streamChunkEnvelope(t, requestID, "openai-response", 3, delta, "claude-opus-5"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := chunkBodyFromEnvelope(t, outDelta); len(b) != 0 {
+		t.Fatalf("foreign function_call delta must pass through, got %s", b)
+	}
+}

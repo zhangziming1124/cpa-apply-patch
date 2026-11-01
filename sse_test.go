@@ -194,7 +194,8 @@ func TestInterceptResponseAfterUsesRequestState(t *testing.T) {
 
 func TestInterceptResponseAfterFallsBackToOriginalRequest(t *testing.T) {
 	currentConfig.Store(defaultPluginConfig())
-	// No request state recorded: non-streaming falls back to OriginalRequest.
+	// Only a request observed before plugin load has no decision entry.
+	// The compatibility fallback must enforce the same client gate.
 	tools := []any{
 		map[string]any{
 			"type": "custom",
@@ -210,6 +211,7 @@ func TestInterceptResponseAfterFallsBackToOriginalRequest(t *testing.T) {
 		"RequestedModel":  "claude-opus-5",
 		"Stream":          false,
 		"OriginalRequest": orig,
+		"RequestHeaders":  map[string][]string{"User-Agent": {"codex_cli_rs/0.45.0"}},
 		"Body":            respBody,
 	})
 	if err != nil {

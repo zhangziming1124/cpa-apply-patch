@@ -312,3 +312,58 @@ func TestUserAgentGateDisablesViaConfig(t *testing.T) {
 		t.Fatal("codex_only: false must be honored by configure()")
 	}
 }
+
+func TestNonStreamFallbackCannotBypassClientGate(t *testing.T) {
+	currentConfig.Store(defaultPluginConfig())
+	orig := []byte(`{"model":"claude-opus-5","tools":[{"type":"custom","name":"apply_patch"}]}`)
+	respBody := []byte(`{"output":[{"id":"fc_2","type":"function_call","status":"completed","arguments":"{\"input\":\"patch\"}","call_id":"call_fb","name":"apply_patch"}]}`)
+	raw, err := json.Marshal(map[string]any{
+		"RequestID":       "req-fb-non-codex",
+		"SourceFormat":    "openai-response",
+		"Model":           "claude-opus-5",
+		"RequestedModel":  "claude-opus-5",
+		"Stream":          false,
+		"RequestHeaders":  map[string][]string{"User-Agent": {"SomeOtherAgent/1.0"}},
+		"OriginalRequest": orig,
+		"Body":            respBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := interceptResponseAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := passthroughResult(t, out); len(body) != 0 {
+		t.Fatalf("non-Codex fallback must not rewrite responses, got %s", body)
+	}
+}
+
+func TestNonStreamRejectedRequestStateCannotFallBack(t *testing.T) {
+	currentConfig.Store(defaultPluginConfig())
+	// Empty names is an explicit "not bridged" decision, not an invitation
+	// to rescan OriginalRequest and potentially double-rewrite a host bridge.
+	streamStates.put("req-empty-names", "openai", map[string]struct{}{})
+	orig := []byte(`{"model":"kimi-k3.1-pro","tools":[{"type":"custom","name":"apply_patch"}]}`)
+	respBody := []byte(`{"output":[{"id":"fc_2","type":"function_call","status":"completed","arguments":"{\"input\":\"patch\"}","call_id":"call_fb","name":"apply_patch"}]}`)
+	raw, err := json.Marshal(map[string]any{
+		"RequestID":       "req-empty-names",
+		"SourceFormat":    "openai-response",
+		"Model":           "kimi-k3.1-pro",
+		"RequestedModel":  "kimi-k3.1-pro",
+		"Stream":          false,
+		"RequestHeaders":  map[string][]string{"User-Agent": {"codex_cli_rs/0.45.0"}},
+		"OriginalRequest": orig,
+		"Body":            respBody,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := interceptResponseAfter(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := passthroughResult(t, out); len(body) != 0 {
+		t.Fatalf("an explicit not-bridged request must stay untouched, got %s", body)
+	}
+}

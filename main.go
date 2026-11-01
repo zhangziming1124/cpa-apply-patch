@@ -77,7 +77,7 @@ import (
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.6.0"
+	pluginVersion = "0.6.1"
 )
 
 // streamStateTTL bounds how long per-request bridging metadata is retained
@@ -383,7 +383,7 @@ func pluginRegistration() registration {
 				{Name: "backend_gemini", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：Gemini / Antigravity。开启后，上游格式为 antigravity（Google 账号 OAuth）或 gemini（Gemini CLI）时桥接 apply_patch。CPA 只把 type=function 转成 functionDeclarations，custom apply_patch 会被静默丢掉。默认开启。"},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "模型名过滤（可与后端勾选叠加）。支持前缀通配，如 grok*、claude*；* 表示不额外限制模型名。默认 [\"*\"]。非 GPT 模型还须在客户端 model_catalog_json 补 apply_patch_tool_type: freeform。"},
 				{Name: "tools", Type: pluginapi.ConfigFieldTypeArray, Description: "桥接哪些 Codex freeform(custom) 工具。默认 [\"apply_patch\"]；填 * 表示客户端声明的所有 custom 工具都桥接。"},
-			{Name: "codex_only", Type: pluginapi.ConfigFieldTypeBoolean, Description: "仅服务 Codex 客户端：User-Agent 含 codex 标识（codex_cli_rs / Codex Desktop / codex_ide 等，大小写不敏感）才参与桥接，第三方 Responses 客户端原样放行。UA 缺失/为空时保守放行（前方有剥头中间层仍可用，后续协议/语义门继续把关）。默认开启；关闭则退回纯协议分流。"},
+				{Name: "codex_only", Type: pluginapi.ConfigFieldTypeBoolean, Description: "仅服务 Codex 客户端：User-Agent 含 codex 标识（codex_cli_rs / Codex Desktop / codex_ide 等，大小写不敏感）才参与桥接，第三方 Responses 客户端原样放行。UA 缺失/为空时保守放行（前方有剥头中间层仍可用，后续协议/语义门继续把关）。默认开启；关闭则退回纯协议分流。"},
 				{Name: "debug_stream_timing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "调试：把流式每片拦截耗时汇总打到 CPA stderr（avg/max）。默认关闭。"},
 			},
 		},
@@ -962,10 +962,7 @@ func interceptResponseAfter(raw []byte) ([]byte, error) {
 	if !bytesContainsFunctionCall(req.Body) {
 		return okEnvelope(pluginapi.ResponseInterceptResponse{})
 	}
-	// Prefer request-direction state when available (it already knows the
-	// upstream format and the bridged names); fall back to OriginalRequest for
-	// executions whose request interception we never observed (e.g. plugin
-	// reloaded mid-request).
+	// An accepted request decision is sufficient to restore its own calls.
 	state, haveState := streamStates.get(req.RequestID)
 	if haveState && len(state.names) > 0 && responseBackendEnabled(cfg, state.fromFormat, req.Model, req.RequestedModel) {
 		newBody, changed := rewriteNonStreamBody(req.Body, state.names)
@@ -974,12 +971,26 @@ func interceptResponseAfter(raw []byte) ([]byte, error) {
 		}
 		return okEnvelope(pluginapi.ResponseInterceptResponse{})
 	}
+	// The request direction owns every bridging decision. If this request was
+	// not accepted by the client/protocol/backend/model gates, its response
+	// must remain untouched: deriving names from OriginalRequest here would
+	// bypass the Codex client gate and could fight a host-native bridge.
+	// A state entry with no names is also an explicit "not bridged" decision.
+	if haveState {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
 	if !strings.EqualFold(strings.TrimSpace(req.SourceFormat), "openai-response") {
 		return okEnvelope(pluginapi.ResponseInterceptResponse{})
 	}
 	if req.Stream {
 		return okEnvelope(pluginapi.ResponseInterceptResponse{})
 	}
+	if cfg.CodexOnly && !codexClientUserAgent(req.RequestHeaders) {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	// Only a request observed before plugin load has no decision entry. This
+	// narrow compatibility fallback applies the same client gate as the
+	// request interceptor before using OriginalRequest.
 	orig := req.OriginalRequest
 	if len(orig) == 0 {
 		return okEnvelope(pluginapi.ResponseInterceptResponse{})

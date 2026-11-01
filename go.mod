@@ -1,6 +1,6 @@
 module github.com/zhangziming1124/cpa-apply-patch
 
-go 1.26.0
+go 1.26.10
 
 require (
 	github.com/router-for-me/CLIProxyAPI/v7 v7.2.101
@@ -10,6 +10,7 @@ require (
 )
 
 require (
+	github.com/router-for-me/CLIProxyAPI/v8 v8.0.46
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
 )

@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.5.0 — 2026-11-01
+
+- **流式热路径重构:告别每帧全量 OriginalRequest 序列化**。此前注册的 `response_after_translator` 让宿主(CPA 主程序)对**每个 SSE 流式帧**都执行 `json.Marshal` 全量信封——包含 1MB+ 的 `OriginalRequest` 完整对话上下文——再跨界传给插件。大上下文 Codex 会话(300k token ≈ 1MB/帧 × 每流几百帧)下,生产实测 22 分钟累计分配 **107GB**,容器多次 OOM(768MB 限额,66 分钟内被杀 16 次)。v0.5.0 改用拦截器三件套:
+  - 流式帧 → `response.intercept_stream_chunk`(schema v3+ 宿主在 payload 帧上**省略** OriginalRequest/RequestBody,仅传 Body+小字段);
+  - 非流式 → `response.intercept_after`(每请求一次,保留 OriginalRequest 回退路径);
+  - 桥接决策(上游格式、bridged 工具名)在**请求方向**一次性算好,按 RequestID 存入 `streamStates` 会话表(15min TTL、256 上限),响应方向每帧 O(1) 查表,不再按帧解码 OriginalRequest。
+  - A/B 实测(生产流量):注册面切换后 `json.Marshal` 分配速率从 **4.9GB/min 降至 1.2MB/s(-98.6%)**,同窗口流式请求正常。
+  - 依赖 CLIProxyAPI v7.2.101 → v8.0.46(RequestID / stream-chunk v3 省略需要)。v7 宿主上 `response_stream_interceptor` 声明被忽略、行为退化为不桥接响应(请求方向改写仍在);建议 v8 宿主使用。
+  - 移除 `normalizeResponseAfter` 与 peek/extract 字节扫描函数族(其存在意义就是绕开宿主每帧携带的大字段)。
+  - `debug_stream_timing` 语义不变,统计对象改为 stream-chunk 拦截耗时。
+
 ## v0.4.6 — 2026-08-21
 
 - **Gemini / Antigravity 原生 apply_patch 桥接**：新增 `backend_gemini` 勾选（默认开）。CPA 的 OpenAI Responses → Gemini/Antigravity 翻译器只把 `type=function` 转成 `functionDeclarations`，`type=custom` 的 apply_patch 会被静默丢掉。请求侧在 `ToFormat=antigravity|gemini` 时先改成 `{input:string}` function；响应侧把 `FromFormat=antigravity|gemini` 的 `function_call` 改回 `custom_tool_call`。覆盖 Google 账号 OAuth（Antigravity）和 Gemini CLI 两条上游。GPT 原生路径仍不碰。

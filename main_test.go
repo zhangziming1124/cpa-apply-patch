@@ -69,5 +69,3 @@ func TestBridgedFingerprint(t *testing.T) {
 		t.Fatal("foreign schema must not match fingerprint")
 	}
 }
-
-

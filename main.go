@@ -55,8 +55,6 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
-	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -68,8 +66,8 @@ import (
 	"unicode/utf16"
 	"unsafe"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"github.com/zhangziming1124/cpa-apply-patch/patchenv"
@@ -78,8 +76,59 @@ import (
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.4.6"
+	pluginVersion = "0.5.0"
 )
+
+// streamStateTTL bounds how long per-request bridging metadata is retained
+// after the last observed activity. Streams finish well within this window;
+// the TTL only guards against leaks from abandoned requests.
+const streamStateTTL = 15 * time.Minute
+
+// streamState carries request-direction decisions (upstream format, bridged
+// tool names) into the response-direction interceptors, so payload chunks
+// never need OriginalRequest again. empty names means "not bridged".
+type streamState struct {
+	fromFormat string
+	names      map[string]struct{}
+	seen       time.Time
+}
+
+type streamStateTable struct {
+	mu sync.Mutex
+	m  map[string]*streamState
+}
+
+var streamStates = &streamStateTable{m: make(map[string]*streamState)}
+
+func (t *streamStateTable) put(requestID, fromFormat string, names map[string]struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.m) >= 256 {
+		cutoff := time.Now().Add(-streamStateTTL)
+		for k, v := range t.m {
+			if v.seen.Before(cutoff) {
+				delete(t.m, k)
+			}
+		}
+	}
+	t.m[requestID] = &streamState{fromFormat: fromFormat, names: names, seen: time.Now()}
+}
+
+func (t *streamStateTable) get(requestID string) (*streamState, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	v, ok := t.m[requestID]
+	if ok {
+		v.seen = time.Now()
+	}
+	return v, ok
+}
+
+func (t *streamStateTable) drop(requestID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.m, requestID)
+}
 
 type pluginConfig struct {
 	Enabled       bool     `yaml:"enabled"`
@@ -148,8 +197,9 @@ type registration struct {
 }
 
 type registrationCapability struct {
-	RequestInterceptor      bool `json:"request_interceptor"`
-	ResponseAfterTranslator bool `json:"response_after_translator"`
+	RequestInterceptor     bool `json:"request_interceptor"`
+	ResponseInterceptor    bool `json:"response_interceptor"`
+	StreamChunkInterceptor bool `json:"response_stream_interceptor"`
 }
 
 type rpcRequestInterceptRequest struct {
@@ -219,8 +269,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	case pluginabi.MethodRequestInterceptAfter:
 		return interceptRequestAfterAuth(request)
-	case pluginabi.MethodResponseNormalizeAfter:
-		return normalizeResponseAfter(request)
+	case pluginabi.MethodResponseInterceptAfter:
+		return interceptResponseAfter(request)
+	case pluginabi.MethodResponseInterceptStreamChunk:
+		return interceptStreamChunk(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -318,12 +370,13 @@ func pluginRegistration() registration {
 				{Name: "backend_gemini", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：Gemini / Antigravity。开启后，上游格式为 antigravity（Google 账号 OAuth）或 gemini（Gemini CLI）时桥接 apply_patch。CPA 只把 type=function 转成 functionDeclarations，custom apply_patch 会被静默丢掉。默认开启。"},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "模型名过滤（可与后端勾选叠加）。支持前缀通配，如 grok*、claude*；* 表示不额外限制模型名。默认 [\"*\"]。非 GPT 模型还须在客户端 model_catalog_json 补 apply_patch_tool_type: freeform。"},
 				{Name: "tools", Type: pluginapi.ConfigFieldTypeArray, Description: "桥接哪些 Codex freeform(custom) 工具。默认 [\"apply_patch\"]；填 * 表示客户端声明的所有 custom 工具都桥接。"},
-				{Name: "debug_stream_timing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "调试：把 response.normalize_after 每片耗时汇总打到 CPA stderr（avg/max）。默认关闭。"},
+				{Name: "debug_stream_timing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "调试：把流式每片拦截耗时汇总打到 CPA stderr（avg/max）。默认关闭。"},
 			},
 		},
 		Capabilities: registrationCapability{
-			RequestInterceptor:      true,
-			ResponseAfterTranslator: true,
+			RequestInterceptor:     true,
+			ResponseInterceptor:    true,
+			StreamChunkInterceptor: true,
 		},
 	}
 }
@@ -337,19 +390,42 @@ func interceptRequestAfterAuth(raw []byte) ([]byte, error) {
 	}
 	cfg := loadedConfig()
 	if !cfg.Enabled {
+		if req.RequestID != "" {
+			streamStates.drop(req.RequestID)
+		}
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	// Codex freeform tools only arrive on the OpenAI Responses protocol.
 	if !strings.EqualFold(strings.TrimSpace(req.SourceFormat), "openai-response") {
+		if req.RequestID != "" {
+			streamStates.drop(req.RequestID)
+		}
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	if !requestBackendEnabled(cfg, req.ToFormat, req.RequestedModel, req.Model, req.Body) {
+		if req.RequestID != "" {
+			streamStates.drop(req.RequestID)
+		}
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	if !modelEnabled(cfg, req.RequestedModel, req.Model, req.Body) {
+		if req.RequestID != "" {
+			streamStates.drop(req.RequestID)
+		}
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 	newBody, changed := rewriteRequestBody(cfg, req.Body)
+	// Record request-direction decisions so response-side interceptors never
+	// need OriginalRequest again (the stream-chunk hook omits it on schema v3+).
+	// Names come from the rewritten body: the bridge leaves a fingerprinted
+	// {"input": string} function tool there even when nothing else changed.
+	if req.RequestID != "" {
+		if changed {
+			streamStates.put(req.RequestID, strings.ToLower(strings.TrimSpace(req.ToFormat)), customToolNames(cfg, newBody))
+		} else {
+			streamStates.put(req.RequestID, strings.ToLower(strings.TrimSpace(req.ToFormat)), customToolNames(cfg, req.Body))
+		}
+	}
 	if !changed {
 		return okEnvelope(pluginapi.RequestInterceptResponse{})
 	}
@@ -814,200 +890,145 @@ func (t *callTracker) drop(itemID string) {
 	delete(t.entries, itemID)
 }
 
-func normalizeResponseAfter(raw []byte) ([]byte, error) {
+// rpcResponseInterceptRequest mirrors the host wire shape for
+// response.intercept_after (non-streaming). The embedded struct uses
+// []byte-with-base64 JSON semantics via encoding/json.
+type rpcResponseInterceptRequest struct {
+	pluginapi.ResponseInterceptRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// interceptResponseAfter handles the non-streaming response path. The host
+// calls it once per completed response with OriginalRequest attached (cheap
+// at this frequency), so the classic lookup semantics stay unchanged.
+func interceptResponseAfter(raw []byte) ([]byte, error) {
+	var req rpcResponseInterceptRequest
+	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
 	cfg := loadedConfig()
 	if !cfg.Enabled {
-		return okEnvelope(pluginapi.PayloadResponse{})
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	if len(req.Body) == 0 {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	// Non-stream responses only need rewriting when they carry a function_call
+	// that maps to a bridged tool; everything else passes through untouched.
+	if !bytesContainsFunctionCall(req.Body) {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	// Prefer request-direction state when available (it already knows the
+	// upstream format and the bridged names); fall back to OriginalRequest for
+	// executions whose request interception we never observed (e.g. plugin
+	// reloaded mid-request).
+	state, haveState := streamStates.get(req.RequestID)
+	if haveState && len(state.names) > 0 && responseBackendEnabled(cfg, state.fromFormat, req.Model, req.RequestedModel) {
+		newBody, changed := rewriteNonStreamBody(req.Body, state.names)
+		if changed {
+			return okEnvelope(pluginapi.ResponseInterceptResponse{Body: newBody})
+		}
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	if !strings.EqualFold(strings.TrimSpace(req.SourceFormat), "openai-response") {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	if req.Stream {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	orig := req.OriginalRequest
+	if len(orig) == 0 {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	if !matchesAny(cfg.Models, req.Model) && !matchesAny(cfg.Models, req.RequestedModel) &&
+		!matchesAny(cfg.Models, gjson.GetBytes(orig, "model").String()) {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	names := customToolNames(cfg, orig)
+	if len(names) == 0 {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	newBody, changed := rewriteNonStreamBody(req.Body, names)
+	if !changed {
+		return okEnvelope(pluginapi.ResponseInterceptResponse{})
+	}
+	return okEnvelope(pluginapi.ResponseInterceptResponse{Body: newBody})
+}
+
+// rpcStreamChunkInterceptRequest mirrors the host wire shape for
+// response.intercept_stream_chunk.
+type rpcStreamChunkInterceptRequest struct {
+	pluginapi.StreamChunkInterceptRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// interceptStreamChunk handles the streaming hot path. The host calls it once
+// per stream chunk with only the chunk body (schema v3+ omits
+// OriginalRequest/RequestBody on payload chunks), so per-chunk cost no longer
+// scales with conversation size. Bridging decisions come from the
+// request-direction streamState table.
+func interceptStreamChunk(raw []byte) ([]byte, error) {
+	var req rpcStreamChunkInterceptRequest
+	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	cfg := loadedConfig()
+	if !cfg.Enabled {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
 	start := time.Now()
-	// Hot path must NOT json.Unmarshal the whole envelope: OriginalRequest is
-	// often 1MB+ base64 and sits before Body. Peek small head fields + Body
-	// from the end (Body is last in host marshal order).
-	fromFormat, toFormat, model, body, errPeek := peekResponseNormFields(raw)
-	if errPeek != nil {
-		return nil, errPeek
+	defer func() { noteStreamTiming(cfg, time.Since(start)) }()
+
+	// Header-init call: no payload to rewrite. Payload chunks may reference the
+	// request state recorded at interception time, so nothing to cache here.
+	if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
-	defer noteStreamTiming(cfg, time.Since(start))
+	body := req.Body
 	if len(body) == 0 {
-		return okEnvelope(pluginapi.PayloadResponse{})
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
-	if !strings.EqualFold(toFormat, "openai-response") {
-		return okEnvelope(pluginapi.PayloadResponse{})
+	if !strings.EqualFold(strings.TrimSpace(req.SourceFormat), "openai-response") {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
-	if !responseBackendEnabled(cfg, fromFormat, model, model) {
-		return okEnvelope(pluginapi.PayloadResponse{})
+	if !isSSEChunk(body) {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
-	// models:["*"] matches any non-empty model; host Model is enough for the
-	// common path. If Model is empty we only continue when a rewriteable event
-	// forces OriginalRequest load below.
-	if model != "" && !matchesAny(cfg.Models, model) {
-		return okEnvelope(pluginapi.PayloadResponse{})
+	event := sseEventType(body)
+	if !sseEventMaybeApplyPatch(event) {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
 
-	var newBody []byte
-	var changed bool
-	if isSSEChunk(body) {
-		event := sseEventType(body)
-		if !sseEventMaybeApplyPatch(event) {
-			return okEnvelope(pluginapi.PayloadResponse{})
+	// arguments.delta/done only need the in-memory tracker, not tool names.
+	// This is the dominant stream volume after a patch tool call starts.
+	if event == "response.function_call_arguments.delta" || event == "response.function_call_arguments.done" {
+		newBody, changed := rewriteSSEChunk(body, nil)
+		if !changed {
+			return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 		}
-		// arguments.delta/done only need the in-memory tracker, not tool names
-		// or OriginalRequest. This is the dominant stream volume after a patch
-		// tool call starts, and also skips all non-tracked noise cheaply.
-		if event == "response.function_call_arguments.delta" || event == "response.function_call_arguments.done" {
-			newBody, changed = rewriteSSEChunk(body, nil)
-		} else {
-			// output_item.* / completed: only load OriginalRequest when the chunk
-			// actually mentions a function_call we might bridge.
-			if event != "response.completed" && !sseChunkHasFunctionCall(body) {
-				return okEnvelope(pluginapi.PayloadResponse{})
-			}
-			if event == "response.completed" && !bytesContainsFunctionCall(body) {
-				return okEnvelope(pluginapi.PayloadResponse{})
-			}
-			orig, errOrig := extractOriginalRequest(raw)
-			if errOrig != nil {
-				return nil, errOrig
-			}
-			origModel := gjson.GetBytes(orig, "model").String()
-			if model == "" && !matchesAny(cfg.Models, origModel) {
-				return okEnvelope(pluginapi.PayloadResponse{})
-			}
-			names := customToolNames(cfg, orig)
-			if len(names) == 0 {
-				return okEnvelope(pluginapi.PayloadResponse{})
-			}
-			newBody, changed = rewriteSSEChunk(body, names)
-		}
-	} else {
-		if !bytesContainsFunctionCall(body) {
-			return okEnvelope(pluginapi.PayloadResponse{})
-		}
-		orig, errOrig := extractOriginalRequest(raw)
-		if errOrig != nil {
-			return nil, errOrig
-		}
-		origModel := gjson.GetBytes(orig, "model").String()
-		if !matchesAny(cfg.Models, model) && !matchesAny(cfg.Models, origModel) {
-			return okEnvelope(pluginapi.PayloadResponse{})
-		}
-		names := customToolNames(cfg, orig)
-		if len(names) == 0 {
-			return okEnvelope(pluginapi.PayloadResponse{})
-		}
-		newBody, changed = rewriteNonStreamBody(body, names)
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{Body: newBody})
 	}
+
+	// output_item.* / completed: consult request-direction state; only proceed
+	// when a bridgeable function_call is actually in the chunk.
+	if event != "response.completed" && !sseChunkHasFunctionCall(body) {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
+	if event == "response.completed" && !bytesContainsFunctionCall(body) {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
+	state, ok := streamStates.get(req.RequestID)
+	if !ok || len(state.names) == 0 {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
+	if !responseBackendEnabled(cfg, state.fromFormat, req.Model, req.RequestedModel) {
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
+	}
+	newBody, changed := rewriteSSEChunk(body, state.names)
 	if !changed {
-		return okEnvelope(pluginapi.PayloadResponse{})
+		return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 	}
-	return okEnvelope(pluginapi.PayloadResponse{Body: newBody})
-}
-
-// peekResponseNormFields reads FromFormat/ToFormat/Model/Body without decoding
-// OriginalRequest. Body is located from the end (host marshals it last).
-func peekResponseNormFields(raw []byte) (fromFormat, toFormat, model string, body []byte, err error) {
-	fromFormat, _ = jsonStringField(raw, "FromFormat")
-	toFormat, _ = jsonStringField(raw, "ToFormat")
-	model, _ = jsonStringField(raw, "Model")
-	body, err = jsonBytesFieldLast(raw, "Body")
-	return fromFormat, toFormat, model, body, err
-}
-
-// jsonStringField finds `"Key":"..."` near the start of the object (small fields).
-func jsonStringField(raw []byte, key string) (string, bool) {
-	needle := []byte(`"` + key + `":"`)
-	i := bytes.Index(raw, needle)
-	if i < 0 {
-		needle = []byte(`"` + key + `": "`)
-		i = bytes.Index(raw, needle)
-		if i < 0 {
-			return "", false
-		}
-	}
-	start := i + len(needle)
-	end, ok := jsonStringEnd(raw, start)
-	if !ok {
-		return "", false
-	}
-	s, errUnquote := strconv.Unquote(`"` + string(raw[start:end]) + `"`)
-	if errUnquote != nil {
-		// field values for formats/models are plain ASCII without escapes
-		return string(raw[start:end]), true
-	}
-	return s, true
-}
-
-// jsonBytesFieldLast finds the last `"Key":"<base64>"` (Body is last field).
-func jsonBytesFieldLast(raw []byte, key string) ([]byte, error) {
-	needle := []byte(`"` + key + `":"`)
-	i := bytes.LastIndex(raw, needle)
-	if i < 0 {
-		needle = []byte(`"` + key + `": "`)
-		i = bytes.LastIndex(raw, needle)
-		if i < 0 {
-			return nil, nil
-		}
-	}
-	start := i + len(needle)
-	end, ok := jsonStringEnd(raw, start)
-	if !ok {
-		return nil, fmt.Errorf("truncated JSON string for %s", key)
-	}
-	// encoding/json encodes []byte as standard base64
-	out := make([]byte, base64.StdEncoding.DecodedLen(end-start))
-	n, errDecode := base64.StdEncoding.Decode(out, raw[start:end])
-	if errDecode != nil {
-		return nil, errDecode
-	}
-	return out[:n], nil
-}
-
-func jsonStringEnd(raw []byte, start int) (int, bool) {
-	for i := start; i < len(raw); i++ {
-		c := raw[i]
-		if c == '\\' {
-			i++
-			continue
-		}
-		if c == '"' {
-			return i, true
-		}
-	}
-	return 0, false
-}
-
-// extractOriginalRequest base64-decodes only OriginalRequest when a rewrite may
-// need tool declarations. Text deltas never call this.
-func extractOriginalRequest(raw []byte) ([]byte, error) {
-	// First occurrence; sits before the huge value so Index stops early on the key.
-	out, err := jsonBytesFieldFirst(raw, "OriginalRequest")
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func jsonBytesFieldFirst(raw []byte, key string) ([]byte, error) {
-	needle := []byte(`"` + key + `":"`)
-	i := bytes.Index(raw, needle)
-	if i < 0 {
-		needle = []byte(`"` + key + `": "`)
-		i = bytes.Index(raw, needle)
-		if i < 0 {
-			return nil, nil
-		}
-	}
-	start := i + len(needle)
-	end, ok := jsonStringEnd(raw, start)
-	if !ok {
-		return nil, fmt.Errorf("truncated JSON string for %s", key)
-	}
-	out := make([]byte, base64.StdEncoding.DecodedLen(end-start))
-	n, errDecode := base64.StdEncoding.Decode(out, raw[start:end])
-	if errDecode != nil {
-		return nil, errDecode
-	}
-	return out[:n], nil
+	return okEnvelope(pluginapi.StreamChunkInterceptResponse{Body: newBody})
 }
 
 // streamTimingAgg is updated only when debug_stream_timing is enabled.

@@ -1,5 +1,7 @@
 github.com/router-for-me/CLIProxyAPI/v7 v7.2.101 h1:+kq/r5WNZ1SHEaZsNz3QWB09zC5TuuIjbPQG7r8kL3w=
 github.com/router-for-me/CLIProxyAPI/v7 v7.2.101/go.mod h1:lTHwMAGajc1wKGQiRtDvYbwV0FWsM7sy+N0ZU5/gxJQ=
+github.com/router-for-me/CLIProxyAPI/v8 v8.0.46 h1:vslplwmBhLV86rm4ESkwByokuR0eOh3ud85ekEHtwlM=
+github.com/router-for-me/CLIProxyAPI/v8 v8.0.46/go.mod h1:PCYpdU5+5Sg+BxCGqi81TnSYpppzDaqe5ryH+Z+gJ64=
 github.com/tidwall/gjson v1.14.2/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=
 github.com/tidwall/gjson v1.18.0 h1:FIDeeyB800efLX89e5a8Y0BNH+LOngJyGrIWxG2FKQY=
 github.com/tidwall/gjson v1.18.0/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=

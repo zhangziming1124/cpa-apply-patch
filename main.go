@@ -77,7 +77,7 @@ import (
 
 const (
 	pluginName    = "cpa-apply-patch"
-	pluginVersion = "0.5.0"
+	pluginVersion = "0.6.0"
 )
 
 // streamStateTTL bounds how long per-request bridging metadata is retained
@@ -138,6 +138,13 @@ type pluginConfig struct {
 	BackendGemini bool     `yaml:"backend_gemini"`
 	Models        []string `yaml:"models"`
 	Tools         []string `yaml:"tools"`
+	// CodexOnly restricts bridging to clients whose User-Agent identifies
+	// as Codex (codex_cli_rs / Codex Desktop / codex_ide). Empty or missing
+	// UA still passes this gate: header-stripping deployments in front of
+	// the proxy keep working, and the protocol/semantic gates below still
+	// apply. Turn off to also bridge third-party Responses clients that
+	// send freeform custom tools.
+	CodexOnly bool `yaml:"codex_only"`
 	// DebugStreamTiming logs per-chunk normalize latency to stderr when true.
 	DebugStreamTiming bool `yaml:"debug_stream_timing"`
 }
@@ -150,6 +157,7 @@ func defaultPluginConfig() pluginConfig {
 		BackendGemini:     true,
 		Models:            []string{"*"},
 		Tools:             []string{"apply_patch"},
+		CodexOnly:         true,
 		DebugStreamTiming: false,
 	}
 }
@@ -162,6 +170,7 @@ type configOverlay struct {
 	BackendGemini     *bool    `yaml:"backend_gemini"`
 	Models            []string `yaml:"models"`
 	Tools             []string `yaml:"tools"`
+	CodexOnly         *bool    `yaml:"codex_only"`
 	DebugStreamTiming *bool    `yaml:"debug_stream_timing"`
 }
 
@@ -307,6 +316,9 @@ func configure(raw []byte) error {
 		if overlay.DebugStreamTiming != nil {
 			cfg.DebugStreamTiming = *overlay.DebugStreamTiming
 		}
+		if overlay.CodexOnly != nil {
+			cfg.CodexOnly = *overlay.CodexOnly
+		}
 		// Explicit empty models/tools lists match nothing (fail-closed).
 		// Absent keys keep defaults from defaultPluginConfig.
 		if overlay.Models != nil {
@@ -371,6 +383,7 @@ func pluginRegistration() registration {
 				{Name: "backend_gemini", Type: pluginapi.ConfigFieldTypeBoolean, Description: "后端服务：Gemini / Antigravity。开启后，上游格式为 antigravity（Google 账号 OAuth）或 gemini（Gemini CLI）时桥接 apply_patch。CPA 只把 type=function 转成 functionDeclarations，custom apply_patch 会被静默丢掉。默认开启。"},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "模型名过滤（可与后端勾选叠加）。支持前缀通配，如 grok*、claude*；* 表示不额外限制模型名。默认 [\"*\"]。非 GPT 模型还须在客户端 model_catalog_json 补 apply_patch_tool_type: freeform。"},
 				{Name: "tools", Type: pluginapi.ConfigFieldTypeArray, Description: "桥接哪些 Codex freeform(custom) 工具。默认 [\"apply_patch\"]；填 * 表示客户端声明的所有 custom 工具都桥接。"},
+			{Name: "codex_only", Type: pluginapi.ConfigFieldTypeBoolean, Description: "仅服务 Codex 客户端：User-Agent 含 codex 标识（codex_cli_rs / Codex Desktop / codex_ide 等，大小写不敏感）才参与桥接，第三方 Responses 客户端原样放行。UA 缺失/为空时保守放行（前方有剥头中间层仍可用，后续协议/语义门继续把关）。默认开启；关闭则退回纯协议分流。"},
 				{Name: "debug_stream_timing", Type: pluginapi.ConfigFieldTypeBoolean, Description: "调试：把流式每片拦截耗时汇总打到 CPA stderr（avg/max）。默认关闭。"},
 			},
 		},
@@ -399,8 +412,9 @@ func interceptRequestAfterAuth(raw []byte) ([]byte, error) {
 	// Client gate: the bridge only serves Codex clients. The client-sent
 	// User-Agent carries an identifying "codex" token (Codex CLI / Codex
 	// Desktop). Requests without a recognizable UA pass through untouched so
-	// third-party Responses clients are never fingerprint-scanned.
-	if !codexClientUserAgent(req.Headers) {
+	// third-party Responses clients are never fingerprint-scanned. Empty or
+	// missing UA conservatively proceeds; see codexClientUserAgent.
+	if cfg.CodexOnly && !codexClientUserAgent(req.Headers) {
 		if req.RequestID != "" {
 			streamStates.drop(req.RequestID)
 		}

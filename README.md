@@ -46,6 +46,7 @@ GPT 系模型走 CPA 原生路径,插件对它们**结构性零干预**:请求�
         backend_gemini: true      # Gemini / Antigravity
         models: ["*"]            # 为哪些模型桥接;支持前缀通配 claude*、grok*
         tools: ["apply_patch"]   # 桥接哪些 freeform 工具;* = 全部 custom 工具
+        codex_only: true         # 仅桥接 Codex 客户端(UA 含 codex 标识,大小写不敏感);UA 缺失/为空保守放行。默认开启,关闭则退回纯协议分流
    ```
 
    完整示例见 [`configs/cpa-config.example.yaml`](configs/cpa-config.example.yaml)。

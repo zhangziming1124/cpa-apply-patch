@@ -12,6 +12,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -264,5 +265,50 @@ func TestUserAgentGate(t *testing.T) {
 	raw, _ = json.Marshal(env)
 	if _, err := interceptRequestAfterAuth(raw); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// codex_only=false disables the client gate: a non-Codex UA reaches the
+// protocol/semantic gates and a freeform custom tool gets bridged again.
+func TestUserAgentGateDisablesViaConfig(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.CodexOnly = false
+	currentConfig.Store(cfg)
+	body := []byte(`{"model":"claude-opus-5","tools":[{"type":"custom","name":"apply_patch","description":"x"}],"input":[]}`)
+	raw, err := json.Marshal(map[string]any{
+		"RequestID":      "req-ua-off",
+		"SourceFormat":   "openai-response",
+		"ToFormat":       "claude",
+		"Model":          "claude-opus-5",
+		"RequestedModel": "claude-opus-5",
+		"Stream":         true,
+		"Headers":        map[string][]string{"User-Agent": {"OpenRouter-Frontend/1.0"}},
+		"Body":           body,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := interceptRequestAfterAuth(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewritten := passthroughResult(t, out); len(rewritten) == 0 {
+		t.Fatal("codex_only=false must re-engage bridging for custom tools regardless of UA")
+	} else if !strings.Contains(string(rewritten), `"type":"function"`) {
+		t.Fatalf("expected custom→function bridge, got %s", rewritten)
+	}
+
+	// Explicit yaml overlay must reach the config too.
+	yamlCfg, err := json.Marshal(struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}{ConfigYAML: []byte("codex_only: false\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configure(yamlCfg); err != nil {
+		t.Fatal(err)
+	}
+	if loadedConfig().CodexOnly {
+		t.Fatal("codex_only: false must be honored by configure()")
 	}
 }

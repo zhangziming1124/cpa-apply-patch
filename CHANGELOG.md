@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.6.0 — 2026-11-01
+
+- **客户端 UA 门(可配置)**:新增 `codex_only`(默认开启)。请求方向在协议门之前先看客户端 User-Agent——含 `codex` 标识(`codex_cli_rs` / `Codex Desktop` / `codex_ide_*`,大小写不敏感)才参与桥接,其余第三方 Responses 客户端原样放行(不做指纹扫描、不记 stream state、响应侧保持惰性)。UA 缺失/为空时保守放行:前方有剥头中间层的部署仍可用,协议门/语义门(type=custom 匹配 + schema 指纹)继续兜底。设 `codex_only: false` 可退回纯协议分流。响应方向不需要 UA 门:桥接决策已在请求方向按 RequestID 记入 streamStates,非 Codex 请求无记录即天然透传。宿主头链路已核验:gin 原始请求头经 `opts.Headers` → conductor `cloneRequestHeaders` 原样抵达 after-auth 拦截器。
+
 ## v0.5.0 — 2026-11-01
 
 - **流式热路径重构:告别每帧全量 OriginalRequest 序列化**。此前注册的 `response_after_translator` 让宿主(CPA 主程序)对**每个 SSE 流式帧**都执行 `json.Marshal` 全量信封——包含 1MB+ 的 `OriginalRequest` 完整对话上下文——再跨界传给插件。大上下文 Codex 会话(300k token ≈ 1MB/帧 × 每流几百帧)下,生产实测 22 分钟累计分配 **107GB**,容器多次 OOM(768MB 限额,66 分钟内被杀 16 次)。v0.5.0 改用拦截器三件套:
